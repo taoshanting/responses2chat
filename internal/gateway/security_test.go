@@ -239,14 +239,48 @@ func TestDeadlineWriterClearsDeadlineAfterEachWrite(t *testing.T) {
 	}
 }
 
+func TestDeadlineWriterBoundsFinalFlush(t *testing.T) {
+	underlying := &deadlineRecorder{HeaderMap: make(http.Header)}
+	writer := &deadlineWriter{ResponseWriter: underlying, timeout: time.Second}
+	if _, err := writer.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	writer.finish()
+
+	if underlying.flushes != 1 {
+		t.Fatalf("flushes=%d, want 1", underlying.flushes)
+	}
+	if len(underlying.deadlines) != 4 ||
+		underlying.deadlines[2].IsZero() ||
+		!underlying.deadlines[3].IsZero() {
+		t.Fatalf("deadlines=%v, final flush must be bounded then cleared", underlying.deadlines)
+	}
+}
+
+func TestHealthCheckUsesBoundedFinalFlush(t *testing.T) {
+	underlying := &deadlineRecorder{HeaderMap: make(http.Header)}
+	handler := &Handler{downstreamWriteTimeout: time.Second}
+	handler.ServeHTTP(underlying, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	if underlying.flushes != 1 || len(underlying.deadlines) < 2 {
+		t.Fatalf("flushes=%d deadlines=%v", underlying.flushes, underlying.deadlines)
+	}
+	last := underlying.deadlines[len(underlying.deadlines)-2:]
+	if last[0].IsZero() || !last[1].IsZero() {
+		t.Fatalf("final health flush deadlines=%v", last)
+	}
+}
+
 type deadlineRecorder struct {
 	HeaderMap http.Header
 	deadlines []time.Time
+	flushes   int
 }
 
 func (w *deadlineRecorder) Header() http.Header         { return w.HeaderMap }
 func (w *deadlineRecorder) WriteHeader(_ int)           {}
 func (w *deadlineRecorder) Write(p []byte) (int, error) { return len(p), nil }
+func (w *deadlineRecorder) Flush()                      { w.flushes++ }
 func (w *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
 	w.deadlines = append(w.deadlines, deadline)
 	return nil

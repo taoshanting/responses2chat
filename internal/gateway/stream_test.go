@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -62,6 +63,136 @@ func TestConvertStreamAccumulatesToolNameAndWaitsForCallID(t *testing.T) {
 	if !strings.Contains(body, `"name":"lookup"`) || !strings.Contains(body, `"call_id":"call_real"`) {
 		t.Fatalf("fragmented tool call was corrupted:\n%s", body)
 	}
+	done := findStreamEvent(t, body, "response.function_call_arguments.done")
+	if done["name"] != "lookup" {
+		t.Fatalf("function arguments done event name=%#v", done["name"])
+	}
+}
+
+func TestConvertStreamDoesNotEmitFragmentedToolName(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"look"}}]},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"up","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	recorder := httptest.NewRecorder()
+	if err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, `"name":"look"`) || strings.Count(body, `"name":"lookup"`) < 2 {
+		t.Fatalf("fragmented tool name leaked into events:\n%s", body)
+	}
+}
+
+func TestConvertStreamUsesEmptyArraysForTextMetadata(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"id":"chatcmpl-text","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	recorder := httptest.NewRecorder()
+	if err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, `"annotations":null`) || strings.Contains(body, `"logprobs":null`) {
+		t.Fatalf("text metadata contains null arrays:\n%s", body)
+	}
+	if !strings.Contains(body, `"annotations":[]`) || !strings.Contains(body, `"logprobs":[]`) {
+		t.Fatalf("text metadata is missing empty arrays:\n%s", body)
+	}
+}
+
+func TestConvertStreamPreservesNamedErrorEvent(t *testing.T) {
+	input := "event: error\ndata: {\"message\":\"boom\",\"code\":\"upstream_broke\"}\n\n"
+	recorder := httptest.NewRecorder()
+	err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("error=%v", err)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error") ||
+		!strings.Contains(body, "event: response.failed") ||
+		!strings.Contains(body, `"code":"upstream_broke"`) ||
+		strings.Contains(body, "truncated_stream") {
+		t.Fatalf("named upstream error was not preserved:\n%s", body)
+	}
+}
+
+func TestConvertStreamIgnoresUnrelatedNamedEvents(t *testing.T) {
+	input := strings.Join([]string{
+		"event: ping",
+		"data: heartbeat",
+		"",
+		"event: telemetry",
+		`data: {"id":"metadata","model":"wrong","error":{"message":"not a stream failure"}}`,
+		"",
+		"event: vendor.chunk",
+		`data: {"id":"chatcmpl-real","created":2,"model":"right","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	recorder := httptest.NewRecorder()
+	if err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "resp_metadata") || strings.Contains(body, `"model":"wrong"`) ||
+		!strings.Contains(body, `"model":"right"`) {
+		t.Fatalf("named metadata event affected the response:\n%s", body)
+	}
+}
+
+func TestConvertStreamRejectsIncompleteToolCompletion(t *testing.T) {
+	tests := []struct {
+		name  string
+		chunk string
+	}{
+		{
+			name:  "no tool",
+			chunk: `{"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		},
+		{
+			name:  "missing call id",
+			chunk: `{"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := "data: " + tc.chunk + "\n\ndata: [DONE]\n\n"
+			recorder := httptest.NewRecorder()
+			err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20)
+			if err == nil || !strings.Contains(recorder.Body.String(), `"code":"invalid_tool_call"`) {
+				t.Fatalf("error=%v body=\n%s", err, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestConvertStreamRejectsUnknownFinishReason(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"id":"chatcmpl-error","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"server_error"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	recorder := httptest.NewRecorder()
+	err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20)
+	if err == nil || !strings.Contains(err.Error(), "server_error") {
+		t.Fatalf("error=%v", err)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: response.failed") ||
+		!strings.Contains(body, `"code":"invalid_finish_reason"`) ||
+		strings.Contains(body, "event: response.completed") {
+		t.Fatalf("unknown finish reason was not failed:\n%s", body)
+	}
 }
 
 func TestConvertStreamIgnoresAdditionalChoices(t *testing.T) {
@@ -107,4 +238,21 @@ func streamTestMeta(t *testing.T) requestMeta {
 		t.Fatal(err)
 	}
 	return meta
+}
+
+func findStreamEvent(t *testing.T, stream, eventType string) map[string]any {
+	t.Helper()
+	for _, block := range strings.Split(stream, "\n\n") {
+		lines := strings.Split(block, "\n")
+		if len(lines) < 2 || lines[0] != "event: "+eventType || !strings.HasPrefix(lines[1], "data: ") {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[1], "data: ")), &event); err != nil {
+			t.Fatal(err)
+		}
+		return event
+	}
+	t.Fatalf("event %q not found in:\n%s", eventType, stream)
+	return nil
 }

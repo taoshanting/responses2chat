@@ -71,6 +71,7 @@ type streamTool struct {
 	emittedBytes int
 	outputIndex  int
 	added        bool
+	modern       bool
 }
 
 type streamReasoning struct {
@@ -106,7 +107,7 @@ func convertStream(w http.ResponseWriter, input io.Reader, meta requestMeta, max
 	state := &streamState{meta: meta, writer: events, tools: make(map[int]*streamTool)}
 	var consumed int64
 	maxEventBytes := minInt64(maxStateBytes, 16<<20)
-	err = readSSE(input, maxEventBytes, func(_ string, data string) error {
+	err = readSSE(input, maxEventBytes, func(event string, data string) error {
 		if int64(len(data)) > maxStateBytes-consumed {
 			return fmt.Errorf("upstream stream exceeds %d bytes", maxStateBytes)
 		}
@@ -116,7 +117,18 @@ func convertStream(w http.ResponseWriter, input io.Reader, meta requestMeta, max
 		}
 		chunk, err := decodeJSONObject(strings.NewReader(data))
 		if err != nil {
+			if event != "" && event != "message" && event != "error" {
+				return nil
+			}
 			return fmt.Errorf("invalid upstream SSE JSON: %w", err)
+		}
+		if event == "error" {
+			return state.fail(chunk)
+		}
+		if event != "" && event != "message" {
+			if _, compatible := chunk["choices"]; !compatible {
+				return nil
+			}
 		}
 		if upstreamError, ok := object(chunk["error"]); ok {
 			return state.fail(upstreamError)
@@ -223,37 +235,76 @@ func (s *streamState) consume(chunk map[string]any) error {
 		// Older Chat-compatible upstreams can still emit the deprecated
 		// delta.function_call shape. Responses has only the modern function-call
 		// Item, so normalize it into tool index zero.
-		if legacy, ok := object(delta["function_call"]); ok {
+		if rawLegacy, exists := delta["function_call"]; exists && rawLegacy != nil {
+			legacy, ok := object(rawLegacy)
+			if !ok {
+				return errors.New("upstream function_call delta must be an object")
+			}
 			tool := s.ensureTool(0)
+			if tool.modern {
+				return errors.New("upstream mixed legacy and modern function calls at index 0")
+			}
 			if tool.callID == "" {
 				tool.callID = newID("call")
 			}
-			if name, ok := legacy["name"].(string); ok {
+			if rawName, exists := legacy["name"]; exists {
+				name, ok := rawName.(string)
+				if !ok {
+					return errors.New("upstream function_call delta name must be a string")
+				}
 				tool.name += name
 			}
-			if arguments, ok := legacy["arguments"].(string); ok {
+			if rawArguments, exists := legacy["arguments"]; exists {
+				arguments, ok := rawArguments.(string)
+				if !ok {
+					return errors.New("upstream function_call delta arguments must be a string")
+				}
 				tool.arguments.WriteString(arguments)
 			}
 			if err := s.emitToolPending(tool, false); err != nil {
 				return err
 			}
 		}
-		toolCalls, _ := delta["tool_calls"].([]any)
+		rawToolCalls, hasToolCalls := delta["tool_calls"]
+		toolCalls, toolCallsOK := rawToolCalls.([]any)
+		if hasToolCalls && rawToolCalls != nil && !toolCallsOK {
+			return errors.New("upstream tool_calls delta must be an array")
+		}
 		for _, rawCall := range toolCalls {
 			call, ok := object(rawCall)
 			if !ok {
-				continue
+				return errors.New("upstream tool_calls delta item must be an object")
 			}
 			index := int(int64Number(call["index"]))
 			tool := s.ensureTool(index)
-			if id, ok := call["id"].(string); ok && tool.callID == "" && !tool.added {
+			tool.modern = true
+			if rawID, exists := call["id"]; exists {
+				id, ok := rawID.(string)
+				if !ok || id == "" {
+					return errors.New("upstream tool call id must be a non-empty string")
+				}
+				if tool.callID != "" && tool.callID != id {
+					return errors.New("upstream changed a tool call id mid-stream")
+				}
 				tool.callID = id
 			}
-			function, _ := object(call["function"])
-			if name, ok := function["name"].(string); ok {
+			rawFunction, hasFunction := call["function"]
+			function, functionOK := object(rawFunction)
+			if hasFunction && rawFunction != nil && !functionOK {
+				return errors.New("upstream tool call function delta must be an object")
+			}
+			if rawName, exists := function["name"]; exists {
+				name, ok := rawName.(string)
+				if !ok {
+					return errors.New("upstream tool call name delta must be a string")
+				}
 				tool.name += name
 			}
-			if arguments, ok := function["arguments"].(string); ok {
+			if rawArguments, exists := function["arguments"]; exists {
+				arguments, ok := rawArguments.(string)
+				if !ok {
+					return errors.New("upstream tool call arguments delta must be a string")
+				}
 				tool.arguments.WriteString(arguments)
 			}
 			if err := s.emitToolPending(tool, false); err != nil {
@@ -337,7 +388,12 @@ func (s *streamState) ensurePart(kind string) (*streamMessage, *streamPart, erro
 	}
 	part := message.parts[kind]
 	if part == nil {
-		part = &streamPart{kind: kind, contentIndex: len(message.partOrder)}
+		part = &streamPart{
+			kind:         kind,
+			contentIndex: len(message.partOrder),
+			logprobs:     []any{},
+			annotations:  []any{},
+		}
 		message.parts[kind] = part
 		message.partOrder = append(message.partOrder, kind)
 	}
@@ -424,10 +480,13 @@ func (s *streamState) ensureTool(index int) *streamTool {
 	return tool
 }
 
-func (s *streamState) emitToolPending(tool *streamTool, allowGeneratedID bool) error {
-	if !tool.added && tool.name != "" {
+func (s *streamState) emitToolPending(tool *streamTool, finishing bool) error {
+	// Chat streams have no function-name delta event equivalent in Responses.
+	// Wait until arguments begin (when the name is normally complete) or the
+	// stream finishes so output_item.added cannot expose a partial name.
+	if !tool.added && tool.name != "" && (tool.arguments.Len() > 0 || finishing) {
 		if tool.callID == "" {
-			if !allowGeneratedID {
+			if !finishing {
 				return nil
 			}
 			tool.callID = newID("call")
@@ -461,7 +520,15 @@ func (s *streamState) emitToolPending(tool *streamTool, allowGeneratedID bool) e
 }
 
 func (s *streamState) finish() error {
-	status, incomplete := responseStatus(s.finishReason)
+	status, incomplete, ok := responseStatus(s.finishReason)
+	if !ok {
+		return s.fail(map[string]any{
+			"message": fmt.Sprintf("upstream stream has unsupported finish_reason %q", s.finishReason),
+			"type":    "upstream_error",
+			"code":    "invalid_finish_reason",
+			"param":   nil,
+		})
+	}
 	itemStatus := "completed"
 	if status == "incomplete" {
 		itemStatus = "incomplete"
@@ -536,7 +603,26 @@ func (s *streamState) finish() error {
 			return err
 		}
 	}
-	for _, tool := range s.sortedTools() {
+	tools := s.sortedTools()
+	if (s.finishReason == "tool_calls" || s.finishReason == "function_call") && len(tools) == 0 {
+		return s.fail(map[string]any{
+			"message": "upstream stream finished for tool calls without producing one",
+			"type":    "upstream_error",
+			"code":    "invalid_tool_call",
+			"param":   nil,
+		})
+	}
+	for _, tool := range tools {
+		if tool.name == "" || tool.callID == "" {
+			return s.fail(map[string]any{
+				"message": "upstream stream produced an incomplete function call",
+				"type":    "upstream_error",
+				"code":    "invalid_tool_call",
+				"param":   nil,
+			})
+		}
+	}
+	for _, tool := range tools {
 		if err := s.emitToolPending(tool, true); err != nil {
 			return err
 		}
@@ -547,6 +633,7 @@ func (s *streamState) finish() error {
 			"item_id":      tool.id,
 			"output_index": tool.outputIndex,
 			"arguments":    tool.arguments.String(),
+			"name":         tool.name,
 		}); err != nil {
 			return err
 		}

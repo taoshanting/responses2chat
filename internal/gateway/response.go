@@ -28,17 +28,29 @@ func convertResponse(body []byte, meta requestMeta) (map[string]any, error) {
 	if choice == nil {
 		return nil, errors.New("upstream response contains no choice at index 0")
 	}
-	message, _ := object(choice["message"])
+	message, ok := object(choice["message"])
+	if !ok {
+		return nil, errors.New("upstream choice at index 0 contains no message object")
+	}
 	finishReason, _ := choice["finish_reason"].(string)
 	if finishReason == "" {
 		return nil, errors.New("upstream response is missing finish_reason")
 	}
-	status, incomplete := responseStatus(finishReason)
+	status, incomplete, ok := responseStatus(finishReason)
+	if !ok {
+		return nil, fmt.Errorf("upstream response has unsupported finish_reason %q", finishReason)
+	}
 	itemStatus := "completed"
 	if status == "incomplete" {
 		itemStatus = "incomplete"
 	}
-	output := convertChatMessage(message, choice, itemStatus, meta.reasoning)
+	output, toolCalls, err := convertChatMessage(message, choice, itemStatus, meta.reasoning)
+	if err != nil {
+		return nil, err
+	}
+	if (finishReason == "tool_calls" || finishReason == "function_call") && toolCalls == 0 {
+		return nil, fmt.Errorf("upstream response finished with %q but contains no complete function call", finishReason)
+	}
 
 	created := int64Number(chat["created"])
 	if created == 0 {
@@ -59,7 +71,7 @@ func convertResponse(body []byte, meta requestMeta) (map[string]any, error) {
 	return response, nil
 }
 
-func convertChatMessage(message, choice map[string]any, itemStatus string, reasoningPassthrough bool) []any {
+func convertChatMessage(message, choice map[string]any, itemStatus string, reasoningPassthrough bool) ([]any, int, error) {
 	output := make([]any, 0)
 	if reasoningPassthrough {
 		if text := chatReasoningText(message); text != "" {
@@ -67,7 +79,11 @@ func convertChatMessage(message, choice map[string]any, itemStatus string, reaso
 		}
 	}
 	contentParts := make([]any, 0, 2)
-	if content, ok := message["content"].(string); ok {
+	if rawContent, exists := message["content"]; exists && rawContent != nil {
+		content, ok := rawContent.(string)
+		if !ok {
+			return nil, 0, errors.New("upstream message content must be a string or null")
+		}
 		part := map[string]any{
 			"type":        "output_text",
 			"text":        content,
@@ -78,11 +94,17 @@ func convertChatMessage(message, choice map[string]any, itemStatus string, reaso
 		}
 		contentParts = append(contentParts, part)
 	}
-	if refusal, ok := message["refusal"].(string); ok && refusal != "" {
-		contentParts = append(contentParts, map[string]any{
-			"type":    "refusal",
-			"refusal": refusal,
-		})
+	if rawRefusal, exists := message["refusal"]; exists && rawRefusal != nil {
+		refusal, ok := rawRefusal.(string)
+		if !ok {
+			return nil, 0, errors.New("upstream message refusal must be a string or null")
+		}
+		if refusal != "" {
+			contentParts = append(contentParts, map[string]any{
+				"type":    "refusal",
+				"refusal": refusal,
+			})
+		}
 	}
 	if len(contentParts) > 0 {
 		output = append(output, map[string]any{
@@ -94,29 +116,63 @@ func convertChatMessage(message, choice map[string]any, itemStatus string, reaso
 		})
 	}
 
-	toolCalls, _ := message["tool_calls"].([]any)
-	for _, raw := range toolCalls {
+	convertedToolCalls := 0
+	rawToolCalls, hasToolCalls := message["tool_calls"]
+	toolCalls, ok := rawToolCalls.([]any)
+	if hasToolCalls && rawToolCalls != nil && !ok {
+		return nil, 0, errors.New("upstream message tool_calls must be an array or null")
+	}
+	for index, raw := range toolCalls {
 		call, ok := object(raw)
-		if !ok || call["type"] != "function" {
+		if !ok {
+			return nil, 0, fmt.Errorf("upstream message tool_calls[%d] must be an object", index)
+		}
+		callType := "function"
+		if rawType, exists := call["type"]; exists {
+			callType, ok = rawType.(string)
+			if !ok || callType == "" {
+				return nil, 0, fmt.Errorf("upstream message tool_calls[%d].type must be a non-empty string", index)
+			}
+		}
+		if callType != "function" {
 			continue
 		}
-		function, _ := object(call["function"])
-		name, _ := function["name"].(string)
-		arguments, _ := function["arguments"].(string)
-		callID, _ := call["id"].(string)
-		if name == "" || callID == "" {
-			continue
+		function, ok := object(call["function"])
+		if !ok {
+			return nil, 0, fmt.Errorf("upstream message tool_calls[%d].function must be an object", index)
+		}
+		name, ok := function["name"].(string)
+		if !ok || name == "" {
+			return nil, 0, fmt.Errorf("upstream message tool_calls[%d].function.name must be a non-empty string", index)
+		}
+		arguments, ok := function["arguments"].(string)
+		if !ok {
+			return nil, 0, fmt.Errorf("upstream message tool_calls[%d].function.arguments must be a string", index)
+		}
+		callID, ok := call["id"].(string)
+		if !ok || callID == "" {
+			return nil, 0, fmt.Errorf("upstream message tool_calls[%d].id must be a non-empty string", index)
 		}
 		output = append(output, functionCallOutput(callID, name, arguments, itemStatus))
+		convertedToolCalls++
 	}
-	if legacy, ok := object(message["function_call"]); ok {
-		name, _ := legacy["name"].(string)
-		arguments, _ := legacy["arguments"].(string)
-		if name != "" {
-			output = append(output, functionCallOutput(newID("call"), name, arguments, itemStatus))
+	if rawLegacy, exists := message["function_call"]; exists && rawLegacy != nil {
+		legacy, ok := object(rawLegacy)
+		if !ok {
+			return nil, 0, errors.New("upstream message function_call must be an object or null")
 		}
+		name, ok := legacy["name"].(string)
+		if !ok || name == "" {
+			return nil, 0, errors.New("upstream message function_call.name must be a non-empty string")
+		}
+		arguments, ok := legacy["arguments"].(string)
+		if !ok {
+			return nil, 0, errors.New("upstream message function_call.arguments must be a string")
+		}
+		output = append(output, functionCallOutput(newID("call"), name, arguments, itemStatus))
+		convertedToolCalls++
 	}
-	return output
+	return output, convertedToolCalls, nil
 }
 
 func chatReasoningText(message map[string]any) string {
@@ -279,14 +335,16 @@ func annotations(value any) []any {
 	return converted
 }
 
-func responseStatus(reason string) (string, any) {
+func responseStatus(reason string) (string, any, bool) {
 	switch reason {
 	case "length":
-		return "incomplete", map[string]any{"reason": "max_output_tokens"}
+		return "incomplete", map[string]any{"reason": "max_output_tokens"}, true
 	case "content_filter":
-		return "incomplete", map[string]any{"reason": "content_filter"}
+		return "incomplete", map[string]any{"reason": "content_filter"}, true
+	case "stop", "tool_calls", "function_call":
+		return "completed", nil, true
 	default:
-		return "completed", nil
+		return "", nil, false
 	}
 }
 

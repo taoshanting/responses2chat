@@ -107,6 +107,9 @@ func ChatCompletionsURL(base string) string {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
+	deadline := &deadlineWriter{ResponseWriter: w, timeout: h.downstreamWriteTimeout}
+	defer deadline.finish()
+	w = deadline
 	if r.Method == http.MethodGet && path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
@@ -121,7 +124,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w = &deadlineWriter{ResponseWriter: w, timeout: h.downstreamWriteTimeout}
 	h.logger.Printf("request: %s %s from %s", r.Method, logField(r.URL.Path), logField(r.RemoteAddr))
 	start := time.Now()
 	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -182,6 +184,15 @@ func (w *deadlineWriter) setDeadline() {
 
 func (w *deadlineWriter) clearDeadline() {
 	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Time{})
+}
+
+// finish flushes net/http's small-response buffer before ServeHTTP returns.
+// Without this explicit flush, net/http may perform the final socket write
+// after Write has cleared its deadline.
+func (w *deadlineWriter) finish() {
+	w.setDeadline()
+	defer w.clearDeadline()
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func (w *deadlineWriter) WriteHeader(status int) {

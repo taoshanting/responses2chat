@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -91,6 +92,47 @@ func TestConvertResponseRejectsMissingFinishReason(t *testing.T) {
 	}`), meta)
 	if err == nil {
 		t.Fatal("response without finish_reason was accepted")
+	}
+}
+
+func TestConvertResponseRejectsUnknownFinishReason(t *testing.T) {
+	_, meta, err := convertRequest([]byte(`{"model":"m","input":"hi"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = convertResponse([]byte(`{
+  "id":"chatcmpl-error",
+  "created":1,
+  "model":"m",
+  "choices":[{"index":0,"message":{"content":"partial"},"finish_reason":"server_error"}]
+}`), meta)
+	if err == nil || !strings.Contains(err.Error(), "server_error") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestConvertResponseRejectsIncompleteToolCompletion(t *testing.T) {
+	_, meta, err := convertRequest([]byte(`{"model":"m","input":"hi"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		message string
+	}{
+		{name: "no tool", message: `{"content":null}`},
+		{
+			name:    "missing call id",
+			message: `{"tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"{}"}}]}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"message":` + tc.message + `,"finish_reason":"tool_calls"}]}`)
+			if _, err := convertResponse(body, meta); err == nil || !strings.Contains(err.Error(), "tool") {
+				t.Fatalf("error=%v", err)
+			}
+		})
 	}
 }
 

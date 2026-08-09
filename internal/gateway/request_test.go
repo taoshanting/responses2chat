@@ -153,6 +153,145 @@ func TestConvertRequestRejectsTrailingJSON(t *testing.T) {
 	}
 }
 
+func TestConvertRequestRejectsMalformedSupportedItems(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantPath string
+	}{
+		{
+			name:     "function arguments",
+			input:    `[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}]`,
+			wantPath: "input[0].arguments",
+		},
+		{
+			name:     "message text part",
+			input:    `[{"type":"message","role":"user","content":[{"type":"input_text"}]}]`,
+			wantPath: "input[0].content[0].text",
+		},
+		{
+			name:     "function output",
+			input:    `[{"type":"function_call_output","call_id":"call_1","output":7}]`,
+			wantPath: "input[0].output",
+		},
+		{
+			name:     "non-object item",
+			input:    `["message"]`,
+			wantPath: "input[0]",
+		},
+		{
+			name:     "invalid item type",
+			input:    `[{"type":7}]`,
+			wantPath: "input[0].type",
+		},
+		{
+			name:     "empty item type",
+			input:    `[{"type":""}]`,
+			wantPath: "input[0].type",
+		},
+		{
+			name:     "missing item discriminator",
+			input:    `[{"payload":7}]`,
+			wantPath: "input[0]",
+		},
+		{
+			name:     "non-object content part",
+			input:    `[{"type":"message","role":"user","content":["text"]}]`,
+			wantPath: "input[0].content[0]",
+		},
+		{
+			name:     "invalid content part type",
+			input:    `[{"type":"message","role":"user","content":[{"type":7}]}]`,
+			wantPath: "input[0].content[0].type",
+		},
+		{
+			name:     "invalid call id does not fall back",
+			input:    `[{"type":"function_call","call_id":7,"id":"fallback","name":"lookup","arguments":"{}"}]`,
+			wantPath: "input[0].call_id",
+		},
+		{
+			name:     "empty image file id",
+			input:    `[{"type":"message","role":"user","content":[{"type":"input_image","file_id":""}]}]`,
+			wantPath: "input[0].content[0].file_id",
+		},
+		{
+			name:     "empty file data",
+			input:    `[{"type":"message","role":"user","content":[{"type":"input_file","file_data":""}]}]`,
+			wantPath: "input[0].content[0].file_data",
+		},
+		{
+			name:     "empty file URL",
+			input:    `[{"type":"message","role":"user","content":[{"type":"input_file","file_url":""}]}]`,
+			wantPath: "input[0].content[0].file_url",
+		},
+		{
+			name:     "non-object tool-output part",
+			input:    `[{"type":"function_call_output","call_id":"call_1","output":[7]}]`,
+			wantPath: "input[0].output[0]",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"m","input":` + tc.input + `}`)
+			if _, _, err := convertRequest(body, false); err == nil || !strings.Contains(err.Error(), tc.wantPath) {
+				t.Fatalf("error=%v, want path %q", err, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestConvertRequestRejectsMalformedToolsAndChoices(t *testing.T) {
+	tests := []struct {
+		name     string
+		fields   string
+		wantPath string
+	}{
+		{name: "non-array tools", fields: `"tools":{}`, wantPath: "tools"},
+		{name: "non-object tool", fields: `"tools":[7]`, wantPath: "tools[0]"},
+		{name: "missing tool type", fields: `"tools":[{"name":"lookup"}]`, wantPath: "tools[0].type"},
+		{name: "missing function name", fields: `"tools":[{"type":"function"}]`, wantPath: "tools[0].name"},
+		{name: "invalid parameters", fields: `"tools":[{"type":"function","name":"lookup","parameters":7}]`, wantPath: "tools[0].parameters"},
+		{name: "invalid choice shape", fields: `"tool_choice":7`, wantPath: "tool_choice"},
+		{
+			name:     "undefined function choice",
+			fields:   `"tools":[{"type":"function","name":"lookup"}],"tool_choice":{"type":"function","name":"missing"}`,
+			wantPath: "tool_choice",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"m","input":"hi",` + tc.fields + `}`)
+			if _, _, err := convertRequest(body, false); err == nil || !strings.Contains(err.Error(), tc.wantPath) {
+				t.Fatalf("error=%v, want path %q", err, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestConvertRequestStillDropsUnknownItemsAndParts(t *testing.T) {
+	got, _, err := convertRequest([]byte(`{
+  "model":"m",
+  "input":[
+    {"type":"future_item","payload":7},
+    {"type":"message","role":"user","content":[
+      {"type":"future_part","payload":7},
+      {"type":"input_text","text":"keep"}
+    ]}
+  ]
+}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := got["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("messages=%#v", messages)
+	}
+	parts := messages[0].(map[string]any)["content"].([]any)
+	if len(parts) != 1 || parts[0].(map[string]any)["text"] != "keep" {
+		t.Fatalf("parts=%#v", parts)
+	}
+}
+
 func TestConvertRequestReasoningPassthrough(t *testing.T) {
 	body := []byte(`{
   "model": "test-model",
@@ -191,5 +330,24 @@ func TestConvertRequestReasoningPassthrough(t *testing.T) {
 		if raw.(map[string]any)["reasoning_content"] != nil {
 			t.Fatal("reasoning_content leaked with passthrough disabled")
 		}
+	}
+}
+
+func TestConvertRequestConcatenatesConsecutiveReasoningItems(t *testing.T) {
+	body := []byte(`{
+  "model":"m",
+  "input":[
+    {"type":"reasoning","summary":[{"type":"summary_text","text":"first"}]},
+    {"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},
+    {"type":"message","role":"assistant","content":"answer"}
+  ]
+}`)
+	got, _, err := convertRequest(body, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := got["messages"].([]any)
+	if len(messages) != 1 || messages[0].(map[string]any)["reasoning_content"] != "first\nsecond" {
+		t.Fatalf("messages=%#v", messages)
 	}
 }
