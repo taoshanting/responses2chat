@@ -173,18 +173,25 @@ func (w *deadlineWriter) setDeadline() {
 	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(w.timeout))
 }
 
+func (w *deadlineWriter) clearDeadline() {
+	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Time{})
+}
+
 func (w *deadlineWriter) WriteHeader(status int) {
 	w.setDeadline()
+	defer w.clearDeadline()
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *deadlineWriter) Write(p []byte) (int, error) {
 	w.setDeadline()
+	defer w.clearDeadline()
 	return w.ResponseWriter.Write(p)
 }
 
 func (w *deadlineWriter) Flush() {
 	w.setDeadline()
+	defer w.clearDeadline()
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -225,6 +232,7 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 			return nil, err
 		}
 		copyEndToEndHeaders(upstreamRequest.Header, r.Header)
+		stripRewrittenRequestHeaders(upstreamRequest.Header)
 		upstreamRequest.Header.Set("Content-Type", "application/json")
 		if meta.stream {
 			upstreamRequest.Header.Set("Accept", "text/event-stream")
@@ -280,6 +288,7 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 		h.proxyError(w, upstreamResponse)
 		return
 	}
+	stripRewrittenResponseHeaders(w.Header())
 	if meta.stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -501,6 +510,7 @@ var hopByHopHeaders = map[string]struct{}{
 	"Keep-Alive":          {},
 	"Proxy-Authenticate":  {},
 	"Proxy-Authorization": {},
+	"Proxy-Connection":    {},
 	"Te":                  {},
 	"Trailer":             {},
 	"Transfer-Encoding":   {},
@@ -529,5 +539,25 @@ func copyEndToEndHeaders(dst, src http.Header) {
 		for _, value := range values {
 			dst.Add(canonical, value)
 		}
+	}
+}
+
+func stripRewrittenRequestHeaders(header http.Header) {
+	for _, name := range []string{"Accept-Encoding", "Content-Encoding", "Content-Md5", "Digest"} {
+		header.Del(name)
+	}
+}
+
+func stripRewrittenResponseHeaders(header http.Header) {
+	for _, name := range []string{
+		"Accept-Ranges",
+		"Content-Encoding",
+		"Content-Md5",
+		"Content-Range",
+		"Digest",
+		"Etag",
+		"Last-Modified",
+	} {
+		header.Del(name)
 	}
 }

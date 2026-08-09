@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -185,6 +186,36 @@ func TestOfficialOpenAIGoClientDecodesStream(t *testing.T) {
 	}
 }
 
+func TestHandlerDecompressesUpstreamResponseBeforeConversion(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			t.Errorf("Go transport did not negotiate gzip: %q", r.Header.Get("Accept-Encoding"))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Etag", `"chat-body"`)
+		writer := gzip.NewWriter(w)
+		_, _ = io.WriteString(writer, `{"id":"chatcmpl-gzip","created":1,"model":"m","choices":[{"index":0,"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+		_ = writer.Close()
+	}))
+	defer upstream.Close()
+	handler, err := New(Config{UpstreamURL: upstream.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	request.Header.Set("Accept-Encoding", "gzip")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"resp_gzip"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Content-Encoding") != "" || response.Header().Get("Etag") != "" {
+		t.Fatalf("stale transformed headers remain: %#v", response.Header())
+	}
+}
+
 func TestHandlerConvertsStreamingFunctionCall(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -325,17 +356,49 @@ func TestHandlerProxiesChatCompletionsStreamVerbatim(t *testing.T) {
 
 func TestCopyEndToEndHeadersRemovesConnectionTokens(t *testing.T) {
 	source := http.Header{
-		"Authorization": []string{"Bearer secret"},
-		"Connection":    []string{"keep-alive, X-Remove-Me"},
-		"X-Remove-Me":   []string{"hop-only"},
+		"Authorization":    []string{"Bearer secret"},
+		"Connection":       []string{"keep-alive, X-Remove-Me"},
+		"Proxy-Connection": []string{"keep-alive"},
+		"X-Remove-Me":      []string{"hop-only"},
 	}
 	destination := make(http.Header)
 	copyEndToEndHeaders(destination, source)
 	if destination.Get("Authorization") != "Bearer secret" {
 		t.Fatalf("authorization was not copied: %#v", destination)
 	}
-	if destination.Get("Connection") != "" || destination.Get("X-Remove-Me") != "" {
+	if destination.Get("Connection") != "" || destination.Get("Proxy-Connection") != "" || destination.Get("X-Remove-Me") != "" {
 		t.Fatalf("hop-by-hop headers leaked: %#v", destination)
+	}
+}
+
+func TestRewrittenPayloadHeadersAreRemoved(t *testing.T) {
+	requestHeaders := http.Header{
+		"Accept-Encoding":  []string{"gzip"},
+		"Content-Encoding": []string{"gzip"},
+		"Content-Md5":      []string{"stale"},
+		"Digest":           []string{"sha-256=stale"},
+		"X-Custom":         []string{"keep"},
+	}
+	stripRewrittenRequestHeaders(requestHeaders)
+	if requestHeaders.Get("Accept-Encoding") != "" || requestHeaders.Get("Content-Encoding") != "" || requestHeaders.Get("Content-Md5") != "" || requestHeaders.Get("Digest") != "" {
+		t.Fatalf("stale request representation headers remain: %#v", requestHeaders)
+	}
+	if requestHeaders.Get("X-Custom") != "keep" {
+		t.Fatal("unrelated request header was removed")
+	}
+
+	responseHeaders := http.Header{
+		"Etag":          []string{`"chat-body"`},
+		"Last-Modified": []string{"Sun, 10 Aug 2026 00:00:00 GMT"},
+		"Digest":        []string{"sha-256=stale"},
+		"X-Custom":      []string{"keep"},
+	}
+	stripRewrittenResponseHeaders(responseHeaders)
+	if responseHeaders.Get("Etag") != "" || responseHeaders.Get("Last-Modified") != "" || responseHeaders.Get("Digest") != "" {
+		t.Fatalf("stale response representation headers remain: %#v", responseHeaders)
+	}
+	if responseHeaders.Get("X-Custom") != "keep" {
+		t.Fatal("unrelated response header was removed")
 	}
 }
 

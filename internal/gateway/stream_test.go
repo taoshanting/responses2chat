@@ -81,6 +81,25 @@ func TestConvertStreamIgnoresAdditionalChoices(t *testing.T) {
 	}
 }
 
+func TestConvertStreamEmitsAndRetainsURLCitations(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"id":"chatcmpl-cite","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"source","annotations":[{"type":"url_citation","url_citation":{"url":"https://example.com","title":"Example","start_index":0,"end_index":6}}]},"finish_reason":"stop"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	recorder := httptest.NewRecorder()
+	if err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: response.output_text.annotation.added") ||
+		!strings.Contains(body, `"url":"https://example.com"`) ||
+		!strings.Contains(body, `"annotations":[{"end_index":6`) {
+		t.Fatalf("stream citation was not preserved:\n%s", body)
+	}
+}
+
 func streamTestMeta(t *testing.T) requestMeta {
 	t.Helper()
 	_, meta, err := convertRequest([]byte(`{"model":"m","input":"hi","stream":true}`), false)

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewRejectsUnsafeUpstreamURLs(t *testing.T) {
@@ -156,4 +157,28 @@ func TestHandlerLogsUntrustedFieldsAsBoundedSingleLineValues(t *testing.T) {
 	if strings.Contains(logs.String(), "m\nforged") || !strings.Contains(logs.String(), `m\nforged`) {
 		t.Fatalf("model was not escaped in logs: %q", logs.String())
 	}
+}
+
+func TestDeadlineWriterClearsDeadlineAfterEachWrite(t *testing.T) {
+	underlying := &deadlineRecorder{HeaderMap: make(http.Header)}
+	writer := &deadlineWriter{ResponseWriter: underlying, timeout: time.Second}
+	if _, err := writer.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if len(underlying.deadlines) != 2 || underlying.deadlines[0].IsZero() || !underlying.deadlines[1].IsZero() {
+		t.Fatalf("deadlines=%v, want non-zero then zero", underlying.deadlines)
+	}
+}
+
+type deadlineRecorder struct {
+	HeaderMap http.Header
+	deadlines []time.Time
+}
+
+func (w *deadlineRecorder) Header() http.Header         { return w.HeaderMap }
+func (w *deadlineRecorder) WriteHeader(_ int)           {}
+func (w *deadlineRecorder) Write(p []byte) (int, error) { return len(p), nil }
+func (w *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
 }

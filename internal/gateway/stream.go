@@ -47,6 +47,7 @@ type streamPart struct {
 	contentIndex int
 	text         strings.Builder
 	logprobs     []any
+	annotations  []any
 	added        bool
 }
 
@@ -206,6 +207,11 @@ func (s *streamState) consume(chunk map[string]any) error {
 				return err
 			}
 		}
+		if converted := annotations(delta["annotations"]); len(converted) > 0 {
+			if err := s.annotationAdded(converted); err != nil {
+				return err
+			}
+		}
 		if refusal, ok := delta["refusal"].(string); ok && refusal != "" {
 			if err := s.textDelta("refusal", refusal, nil); err != nil {
 				return err
@@ -321,10 +327,10 @@ func (s *streamState) ensureMessage() (*streamMessage, error) {
 	return s.message, nil
 }
 
-func (s *streamState) textDelta(kind, delta string, logprobs any) error {
+func (s *streamState) ensurePart(kind string) (*streamMessage, *streamPart, error) {
 	message, err := s.ensureMessage()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	part := message.parts[kind]
 	if part == nil {
@@ -346,8 +352,16 @@ func (s *streamState) textDelta(kind, delta string, logprobs any) error {
 			"content_index": part.contentIndex,
 			"part":          payload,
 		}); err != nil {
-			return err
+			return nil, nil, err
 		}
+	}
+	return message, part, nil
+}
+
+func (s *streamState) textDelta(kind, delta string, logprobs any) error {
+	message, part, err := s.ensurePart(kind)
+	if err != nil {
+		return err
 	}
 	part.text.WriteString(delta)
 	eventType := "response.output_text.delta"
@@ -370,6 +384,27 @@ func (s *streamState) textDelta(kind, delta string, logprobs any) error {
 		payload["logprobs"] = converted
 	}
 	return s.writer.event(eventType, payload)
+}
+
+func (s *streamState) annotationAdded(values []any) error {
+	message, part, err := s.ensurePart("output_text")
+	if err != nil {
+		return err
+	}
+	for _, annotation := range values {
+		index := len(part.annotations)
+		part.annotations = append(part.annotations, annotation)
+		if err := s.writer.event("response.output_text.annotation.added", map[string]any{
+			"item_id":          message.id,
+			"output_index":     message.outputIndex,
+			"content_index":    part.contentIndex,
+			"annotation_index": index,
+			"annotation":       annotation,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *streamState) ensureTool(index int) *streamTool {
@@ -463,7 +498,7 @@ func (s *streamState) finish() error {
 			part := s.message.parts[kind]
 			partText := part.text.String()
 			eventType := "response.output_text.done"
-			content := map[string]any{"type": "output_text", "text": partText, "annotations": []any{}}
+			content := map[string]any{"type": "output_text", "text": partText, "annotations": part.annotations}
 			payload := map[string]any{
 				"item_id":       s.message.id,
 				"output_index":  s.message.outputIndex,
@@ -580,7 +615,7 @@ func (s *streamState) messageItem(status string) map[string]any {
 			content = append(content, map[string]any{
 				"type":        "output_text",
 				"text":        partText,
-				"annotations": []any{},
+				"annotations": part.annotations,
 				"logprobs":    part.logprobs,
 			})
 		}
