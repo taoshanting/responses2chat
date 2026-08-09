@@ -235,12 +235,16 @@ func (u *Updater) StartBackground(ctx context.Context) {
 		u.logger.Printf("update: disabled")
 		return
 	}
+	u.mu.Lock()
 	u.bgCtx = ctx
+	u.mu.Unlock()
 	u.logger.Printf("update: enabled, channel=%s, interval=%ds", cfg.Channel, cfg.CheckInterval)
 	go u.loop(ctx)
 }
 
 func (u *Updater) bgContext() context.Context {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
 	if u.bgCtx != nil {
 		return u.bgCtx
 	}
@@ -396,14 +400,15 @@ func (u *Updater) waitForIdle(ctx context.Context) error {
 		return nil
 	}
 	u.logger.Printf("update: waiting for in-flight jobs to finish before applying (max %s)", idleWaitTimeout)
-	deadline := time.After(idleWaitTimeout)
+	deadline := time.NewTimer(idleWaitTimeout)
+	defer deadline.Stop()
 	ticker := time.NewTicker(idlePollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-deadline:
+		case <-deadline.C:
 			u.logger.Printf("update: idle wait timed out, applying anyway")
 			return nil
 		case <-ticker.C:
@@ -1246,28 +1251,40 @@ func (u *Updater) applyUpdateUnix(newBinaryPath, tag string) error {
 		return fmt.Errorf("resolve symlinks: %w", err)
 	}
 
-	backupPath := execPath + ".bak"
-	if err := os.Rename(execPath, backupPath); err != nil {
-		return fmt.Errorf("backup current binary: %w", err)
-	}
-	if err := copyFile(newBinaryPath, execPath); err != nil {
-		_ = os.Rename(backupPath, execPath)
-		return fmt.Errorf("install new binary: %w", err)
-	}
-	if err := os.Chmod(execPath, 0o755); err != nil {
-		_ = os.Rename(backupPath, execPath)
-		_ = os.Remove(newBinaryPath)
-		return fmt.Errorf("chmod new binary: %w", err)
+	backupPath, err := installBinaryUnix(newBinaryPath, execPath)
+	if err != nil {
+		return err
 	}
 
-	_ = os.Remove(backupPath)
 	_ = os.Remove(newBinaryPath)
 
 	u.logger.Printf("update: restarting with new binary %s", tag)
 	u.mu.Lock()
 	u.status.Progress = progressComplete
 	u.mu.Unlock()
-	return replaceProcess(execPath, os.Args, os.Environ())
+	if err := replaceProcess(execPath, os.Args, os.Environ()); err != nil {
+		return rollbackBinary(execPath, backupPath, fmt.Errorf("restart with new binary: %w", err))
+	}
+	return nil
+}
+
+func installBinaryUnix(newBinaryPath, execPath string) (string, error) {
+	backupPath := execPath + ".bak"
+	// On Unix, rename atomically replaces a stale regular-file backup.
+	if err := os.Rename(execPath, backupPath); err != nil {
+		return "", fmt.Errorf("backup current binary: %w", err)
+	}
+	if err := copyFile(newBinaryPath, execPath, 0o755); err != nil {
+		return "", rollbackBinary(execPath, backupPath, fmt.Errorf("install new binary: %w", err))
+	}
+	return backupPath, nil
+}
+
+func rollbackBinary(execPath, backupPath string, cause error) error {
+	if err := os.Rename(backupPath, execPath); err != nil {
+		return fmt.Errorf("%w; rollback failed: %v", cause, err)
+	}
+	return cause
 }
 
 func (u *Updater) applyUpdateWindows(newBinaryPath, tag string) error {
@@ -1347,22 +1364,38 @@ func (u *Updater) applyUpdateWindows(newBinaryPath, tag string) error {
 	return nil
 }
 
-func copyFile(src, dst string) error {
+func copyFile(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.Create(dst)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = out.Close()
+			_ = os.Remove(dst)
+		}
+	}()
 	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Chmod(mode); err != nil {
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	complete = true
+	return nil
 }
 
 func normalizeConfig(cfg Config) Config {

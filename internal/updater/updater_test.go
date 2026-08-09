@@ -271,7 +271,9 @@ func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
 	cancel()
 
 	u := testUpdater(Config{})
+	u.mu.Lock()
 	u.bgCtx = ctx
+	u.mu.Unlock()
 	u.hooks.BeforeExec = func(tag string) error {
 		return context.Canceled
 	}
@@ -501,6 +503,82 @@ func TestWaitForIdleStopsWhenApplicationContextIsCanceled(t *testing.T) {
 
 	if err := u.waitForIdle(ctx); err != context.Canceled {
 		t.Fatalf("waitForIdle error = %v, want context.Canceled", err)
+	}
+}
+
+func TestInstallBinaryUnixReplacesStaleBackup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix replacement semantics")
+	}
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "responses2chat")
+	backupPath := execPath + ".bak"
+	newBinaryPath := filepath.Join(dir, "responses2chat-new")
+	if err := os.WriteFile(execPath, []byte("current"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupPath, []byte("stale"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newBinaryPath, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	gotBackupPath, err := installBinaryUnix(newBinaryPath, execPath)
+	if err != nil {
+		t.Fatalf("installBinaryUnix returned error: %v", err)
+	}
+	if gotBackupPath != backupPath {
+		t.Fatalf("backup path = %q, want %q", gotBackupPath, backupPath)
+	}
+	assertFileContent(t, execPath, "replacement")
+	assertFileContent(t, backupPath, "current")
+	info, err := os.Stat(execPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("installed mode = %o, want 755", got)
+	}
+}
+
+func TestInstallBinaryUnixRollsBackAfterCopyFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix replacement semantics")
+	}
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "responses2chat")
+	if err := os.WriteFile(execPath, []byte("current"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := installBinaryUnix(filepath.Join(dir, "missing-new-binary"), execPath)
+	if err == nil || !strings.Contains(err.Error(), "install new binary") {
+		t.Fatalf("expected install error, got %v", err)
+	}
+	assertFileContent(t, execPath, "current")
+	if _, err := os.Stat(execPath + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("rollback left backup behind: %v", err)
+	}
+}
+
+func TestRollbackBinaryReportsRestoreFailure(t *testing.T) {
+	dir := t.TempDir()
+	cause := fmt.Errorf("install failed")
+	err := rollbackBinary(filepath.Join(dir, "responses2chat"), filepath.Join(dir, "missing.bak"), cause)
+	if err == nil || !strings.Contains(err.Error(), cause.Error()) || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("expected combined rollback error, got %v", err)
+	}
+}
+
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("content of %s = %q, want %q", path, got, want)
 	}
 }
 
