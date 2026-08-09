@@ -1302,7 +1302,6 @@ func (u *Updater) applyUpdateWindows(newBinaryPath, tag string) error {
 	}
 
 	updateDir := filepath.Dir(newBinaryPath)
-	scriptPath := filepath.Join(updateDir, "apply-"+sanitizePathPart(tag)+".ps1")
 	backupPath := execPath + ".bak"
 	script := strings.Join([]string{
 		"$ErrorActionPreference = 'Stop'",
@@ -1330,8 +1329,24 @@ func (u *Updater) applyUpdateWindows(newBinaryPath, tag string) error {
 		"}",
 		"",
 	}, "\r\n")
-	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+	scriptFile, err := os.CreateTemp(updateDir, ".apply-*.ps1")
+	if err != nil {
+		return fmt.Errorf("create apply script: %w", err)
+	}
+	scriptPath := scriptFile.Name()
+	if _, err := io.WriteString(scriptFile, script); err != nil {
+		_ = scriptFile.Close()
+		_ = os.Remove(scriptPath)
 		return fmt.Errorf("write apply script: %w", err)
+	}
+	if err := scriptFile.Sync(); err != nil {
+		_ = scriptFile.Close()
+		_ = os.Remove(scriptPath)
+		return fmt.Errorf("sync apply script: %w", err)
+	}
+	if err := scriptFile.Close(); err != nil {
+		_ = os.Remove(scriptPath)
+		return fmt.Errorf("close apply script: %w", err)
 	}
 
 	if u.hooks.BeforeExec != nil {
@@ -1485,7 +1500,34 @@ func psArray(values []string) string {
 	}
 	quoted := make([]string, 0, len(values))
 	for _, value := range values {
-		quoted = append(quoted, psQuote(value))
+		quoted = append(quoted, psQuote(quoteWindowsArg(value)))
 	}
 	return "@(" + strings.Join(quoted, ", ") + ")"
+}
+
+// quoteWindowsArg preserves one Go argument when PowerShell joins the
+// Start-Process ArgumentList array into a Windows command line.
+func quoteWindowsArg(value string) string {
+	var b strings.Builder
+	b.Grow(len(value) + 2)
+	b.WriteByte('"')
+	backslashes := 0
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' {
+			backslashes++
+			continue
+		}
+		if value[i] == '"' {
+			backslashes = backslashes*2 + 1
+		}
+		for ; backslashes > 0; backslashes-- {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(value[i])
+	}
+	for ; backslashes > 0; backslashes-- {
+		b.WriteString(`\\`)
+	}
+	b.WriteByte('"')
+	return b.String()
 }

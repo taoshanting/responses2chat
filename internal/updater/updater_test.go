@@ -571,6 +571,17 @@ func TestRollbackBinaryReportsRestoreFailure(t *testing.T) {
 	}
 }
 
+func TestPSArrayPreservesWindowsArguments(t *testing.T) {
+	if got := psArray(nil); got != "@()" {
+		t.Fatalf("empty psArray = %q, want @()", got)
+	}
+	args := []string{"plain", "two words", "", `C:\Program Files\app\`, `a"b`, "it's"}
+	want := `@('"plain"', '"two words"', '""', '"C:\Program Files\app\\"', '"a\"b"', '"it''s"')`
+	if got := psArray(args); got != want {
+		t.Fatalf("psArray = %q, want %q", got, want)
+	}
+}
+
 func assertFileContent(t *testing.T, path, want string) {
 	t.Helper()
 	got, err := os.ReadFile(path)
