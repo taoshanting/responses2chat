@@ -422,3 +422,29 @@ func TestHandlerRetryDisabledPassesErrorThrough(t *testing.T) {
 		t.Fatalf("attempts = %d, want 1", attempts)
 	}
 }
+
+func TestHandlerDoesNotRetryWithoutSemanticParameters(t *testing.T) {
+	var attempts int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"Unsupported parameter: 'response_format'","param":"response_format"}}`)
+	}))
+	defer upstream.Close()
+
+	handler, err := New(Config{UpstreamURL: upstream.URL, RetryUnsupportedParams: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{
+	  "model":"m",
+	  "input":"hi",
+	  "text":{"format":{"type":"json_object"}}
+	}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || attempts != 1 {
+		t.Fatalf("status=%d attempts=%d body=%s", response.Code, attempts, response.Body.String())
+	}
+}

@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -130,6 +131,19 @@ func TestConvertRequestDropsUnsupportedOnly(t *testing.T) {
 	}
 	if got["tool_choice"] != "none" || meta.appliedToolChoice != "none" {
 		t.Fatalf("required unsupported tools must degrade to none: %#v", got["tool_choice"])
+	}
+}
+
+func TestConvertRequestValidatesModel(t *testing.T) {
+	for _, body := range []string{
+		`{"input":"hi"}`,
+		`{"model":42,"input":"hi"}`,
+		`{"model":"   ","input":"hi"}`,
+		`{"model":"` + strings.Repeat("m", maxModelNameBytes+1) + `","input":"hi"}`,
+	} {
+		if _, _, err := convertRequest([]byte(body), false); err == nil {
+			t.Fatalf("invalid model request was accepted: %.80s", body)
+		}
 	}
 }
 

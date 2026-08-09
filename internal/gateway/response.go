@@ -17,12 +17,22 @@ func convertResponse(body []byte, meta requestMeta) (map[string]any, error) {
 	if len(choices) == 0 {
 		return nil, errors.New("upstream response contains no choices")
 	}
-	choice, ok := object(choices[0])
-	if !ok {
-		return nil, errors.New("upstream response contains an invalid choice")
+	var choice map[string]any
+	for _, raw := range choices {
+		candidate, ok := object(raw)
+		if ok && int64Number(candidate["index"]) == 0 {
+			choice = candidate
+			break
+		}
+	}
+	if choice == nil {
+		return nil, errors.New("upstream response contains no choice at index 0")
 	}
 	message, _ := object(choice["message"])
 	finishReason, _ := choice["finish_reason"].(string)
+	if finishReason == "" {
+		return nil, errors.New("upstream response is missing finish_reason")
+	}
 	status, incomplete := responseStatus(finishReason)
 	itemStatus := "completed"
 	if status == "incomplete" {
@@ -243,7 +253,30 @@ func annotations(value any) []any {
 	if !ok {
 		return []any{}
 	}
-	return items
+	converted := make([]any, 0, len(items))
+	for _, raw := range items {
+		annotation, ok := object(raw)
+		if !ok || annotation["type"] != "url_citation" {
+			continue
+		}
+		source := annotation
+		if nested, ok := object(annotation["url_citation"]); ok {
+			source = nested
+		}
+		urlValue, _ := source["url"].(string)
+		if urlValue == "" {
+			continue
+		}
+		citation := map[string]any{
+			"type":        "url_citation",
+			"url":         urlValue,
+			"title":       stringValue(source["title"]),
+			"start_index": int64Number(source["start_index"]),
+			"end_index":   int64Number(source["end_index"]),
+		}
+		converted = append(converted, citation)
+	}
+	return converted
 }
 
 func responseStatus(reason string) (string, any) {

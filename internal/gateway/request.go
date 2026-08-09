@@ -16,10 +16,19 @@ type requestMeta struct {
 	reasoning         bool
 }
 
+const maxModelNameBytes = 512
+
 func convertRequest(body []byte, reasoningPassthrough bool) (map[string]any, requestMeta, error) {
 	src, err := decodeJSONObject(bytes.NewReader(body))
 	if err != nil {
 		return nil, requestMeta{}, fmt.Errorf("invalid JSON request: %w", err)
+	}
+	model, ok := src["model"].(string)
+	if !ok || strings.TrimSpace(model) == "" {
+		return nil, requestMeta{}, errors.New("model must be a non-empty string")
+	}
+	if len(model) > maxModelNameBytes {
+		return nil, requestMeta{}, fmt.Errorf("model must not exceed %d bytes", maxModelNameBytes)
 	}
 
 	dst := make(map[string]any)

@@ -89,6 +89,9 @@ func TestProxyURL(t *testing.T) {
 		{"https", "https://proxy.example:443", false},
 		{"socks5", "socks5://user:pass@127.0.0.1:1080", false},
 		{"socks5h", "socks5h://127.0.0.1:1080", false},
+		{"path", "https://proxy.example/mirror", true},
+		{"query", "https://proxy.example?token=secret", true},
+		{"fragment", "https://proxy.example#fragment", true},
 		{"unsupported scheme", "ftp://127.0.0.1:21", true},
 		{"missing host", "http://", true},
 		{"not a URL", "://bad", true},
@@ -116,6 +119,28 @@ func TestProxyURL(t *testing.T) {
 				t.Fatalf("ValidateServer: %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateServerRejectsUnsafeUpstreamURLs(t *testing.T) {
+	for _, raw := range []string{
+		"ftp://up.example/v1",
+		"https://user:secret@up.example/v1",
+		"https://up.example/v1?token=secret",
+		"https://up.example/v1#fragment",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if err := (Config{UpstreamBaseURL: raw}).ValidateServer(); err == nil {
+				t.Fatalf("ValidateServer accepted %q", raw)
+			}
+		})
+	}
+}
+
+func TestValidateServerAllowsQueryOnFullUpstreamURL(t *testing.T) {
+	cfg := Config{UpstreamChatCompletionsURL: "https://up.example/v1/chat/completions?api-version=2026-01-01"}
+	if err := cfg.ValidateServer(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -192,6 +217,23 @@ func TestMigrateAddsMissingSettings(t *testing.T) {
 	}
 	if cfg.Update.Source != "github" {
 		t.Fatalf("update.source = %q, want template default github", cfg.Update.Source)
+	}
+}
+
+func TestMigratePreservesConfigPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"upstream_base_url":"https://up.example/v1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Migrate(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config mode=%#o, want 0600", got)
 	}
 }
 

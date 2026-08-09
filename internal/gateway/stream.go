@@ -45,7 +45,7 @@ func (w *eventWriter) event(eventType string, data map[string]any) error {
 type streamPart struct {
 	kind         string
 	contentIndex int
-	text         string
+	text         strings.Builder
 	logprobs     []any
 	added        bool
 }
@@ -63,7 +63,7 @@ type streamTool struct {
 	id           string
 	callID       string
 	name         string
-	arguments    string
+	arguments    strings.Builder
 	emittedBytes int
 	outputIndex  int
 	added        bool
@@ -73,7 +73,7 @@ type streamReasoning struct {
 	id          string
 	outputIndex int
 	added       bool
-	text        string
+	text        strings.Builder
 }
 
 type streamState struct {
@@ -88,18 +88,25 @@ type streamState struct {
 	tools        map[int]*streamTool
 	nextOutput   int
 	finishReason string
+	sawFinish    bool
 	usage        any
 	serviceTier  any
 	failed       bool
 }
 
-func convertStream(w http.ResponseWriter, input io.Reader, meta requestMeta) error {
+func convertStream(w http.ResponseWriter, input io.Reader, meta requestMeta, maxStateBytes int64) error {
 	events, err := newEventWriter(w)
 	if err != nil {
 		return err
 	}
 	state := &streamState{meta: meta, writer: events, tools: make(map[int]*streamTool)}
-	err = readSSE(input, func(_ string, data string) error {
+	var consumed int64
+	maxEventBytes := minInt64(maxStateBytes, 16<<20)
+	err = readSSE(input, maxEventBytes, func(_ string, data string) error {
+		if int64(len(data)) > maxStateBytes-consumed {
+			return fmt.Errorf("upstream stream exceeds %d bytes", maxStateBytes)
+		}
+		consumed += int64(len(data))
 		if data == "[DONE]" {
 			return io.EOF
 		}
@@ -129,6 +136,14 @@ func convertStream(w http.ResponseWriter, input io.Reader, meta requestMeta) err
 			"message": "upstream stream ended before producing a response",
 			"type":    "upstream_error",
 			"code":    "empty_stream",
+			"param":   nil,
+		})
+	}
+	if !state.sawFinish {
+		return state.fail(map[string]any{
+			"message": "upstream stream ended before finish_reason",
+			"type":    "upstream_error",
+			"code":    "truncated_stream",
 			"param":   nil,
 		})
 	}
@@ -171,8 +186,12 @@ func (s *streamState) consume(chunk map[string]any) error {
 		if !ok {
 			continue
 		}
+		if int64Number(choice["index"]) != 0 {
+			continue
+		}
 		if finish, ok := choice["finish_reason"].(string); ok && finish != "" {
 			s.finishReason = finish
+			s.sawFinish = true
 		}
 		delta, _ := object(choice["delta"])
 		if s.meta.reasoning {
@@ -197,13 +216,16 @@ func (s *streamState) consume(chunk map[string]any) error {
 		// Item, so normalize it into tool index zero.
 		if legacy, ok := object(delta["function_call"]); ok {
 			tool := s.ensureTool(0)
+			if tool.callID == "" {
+				tool.callID = newID("call")
+			}
 			if name, ok := legacy["name"].(string); ok {
 				tool.name += name
 			}
 			if arguments, ok := legacy["arguments"].(string); ok {
-				tool.arguments += arguments
+				tool.arguments.WriteString(arguments)
 			}
-			if err := s.emitToolPending(tool); err != nil {
+			if err := s.emitToolPending(tool, false); err != nil {
 				return err
 			}
 		}
@@ -215,17 +237,17 @@ func (s *streamState) consume(chunk map[string]any) error {
 			}
 			index := int(int64Number(call["index"]))
 			tool := s.ensureTool(index)
-			if id, ok := call["id"].(string); ok && tool.callID == "" {
+			if id, ok := call["id"].(string); ok && tool.callID == "" && !tool.added {
 				tool.callID = id
 			}
 			function, _ := object(call["function"])
-			if name, ok := function["name"].(string); ok && tool.name == "" {
-				tool.name = name
+			if name, ok := function["name"].(string); ok {
+				tool.name += name
 			}
 			if arguments, ok := function["arguments"].(string); ok {
-				tool.arguments += arguments
+				tool.arguments.WriteString(arguments)
 			}
-			if err := s.emitToolPending(tool); err != nil {
+			if err := s.emitToolPending(tool, false); err != nil {
 				return err
 			}
 		}
@@ -263,7 +285,7 @@ func (s *streamState) reasoningDelta(delta string) error {
 			return err
 		}
 	}
-	s.reasoning.text += delta
+	s.reasoning.text.WriteString(delta)
 	return s.writer.event("response.reasoning_summary_text.delta", map[string]any{
 		"item_id":       s.reasoning.id,
 		"output_index":  s.reasoning.outputIndex,
@@ -327,7 +349,7 @@ func (s *streamState) textDelta(kind, delta string, logprobs any) error {
 			return err
 		}
 	}
-	part.text += delta
+	part.text.WriteString(delta)
 	eventType := "response.output_text.delta"
 	payload := map[string]any{
 		"item_id":       message.id,
@@ -364,9 +386,12 @@ func (s *streamState) ensureTool(index int) *streamTool {
 	return tool
 }
 
-func (s *streamState) emitToolPending(tool *streamTool) error {
+func (s *streamState) emitToolPending(tool *streamTool, allowGeneratedID bool) error {
 	if !tool.added && tool.name != "" {
 		if tool.callID == "" {
+			if !allowGeneratedID {
+				return nil
+			}
 			tool.callID = newID("call")
 		}
 		tool.added = true
@@ -384,9 +409,10 @@ func (s *streamState) emitToolPending(tool *streamTool) error {
 			return err
 		}
 	}
-	if tool.added && tool.emittedBytes < len(tool.arguments) {
-		delta := tool.arguments[tool.emittedBytes:]
-		tool.emittedBytes = len(tool.arguments)
+	arguments := tool.arguments.String()
+	if tool.added && tool.emittedBytes < len(arguments) {
+		delta := arguments[tool.emittedBytes:]
+		tool.emittedBytes = len(arguments)
 		return s.writer.event("response.function_call_arguments.delta", map[string]any{
 			"item_id":      tool.id,
 			"output_index": tool.outputIndex,
@@ -408,11 +434,12 @@ func (s *streamState) finish() error {
 		}
 	}
 	if s.reasoning != nil && s.reasoning.added {
+		reasoningText := s.reasoning.text.String()
 		if err := s.writer.event("response.reasoning_summary_text.done", map[string]any{
 			"item_id":       s.reasoning.id,
 			"output_index":  s.reasoning.outputIndex,
 			"summary_index": 0,
-			"text":          s.reasoning.text,
+			"text":          reasoningText,
 		}); err != nil {
 			return err
 		}
@@ -420,13 +447,13 @@ func (s *streamState) finish() error {
 			"item_id":       s.reasoning.id,
 			"output_index":  s.reasoning.outputIndex,
 			"summary_index": 0,
-			"part":          map[string]any{"type": "summary_text", "text": s.reasoning.text},
+			"part":          map[string]any{"type": "summary_text", "text": reasoningText},
 		}); err != nil {
 			return err
 		}
 		if err := s.writer.event("response.output_item.done", map[string]any{
 			"output_index": s.reasoning.outputIndex,
-			"item":         reasoningItem(s.reasoning.id, s.reasoning.text, itemStatus),
+			"item":         reasoningItem(s.reasoning.id, reasoningText, itemStatus),
 		}); err != nil {
 			return err
 		}
@@ -434,19 +461,20 @@ func (s *streamState) finish() error {
 	if s.message != nil {
 		for _, kind := range s.message.partOrder {
 			part := s.message.parts[kind]
+			partText := part.text.String()
 			eventType := "response.output_text.done"
-			content := map[string]any{"type": "output_text", "text": part.text, "annotations": []any{}}
+			content := map[string]any{"type": "output_text", "text": partText, "annotations": []any{}}
 			payload := map[string]any{
 				"item_id":       s.message.id,
 				"output_index":  s.message.outputIndex,
 				"content_index": part.contentIndex,
-				"text":          part.text,
+				"text":          partText,
 			}
 			if kind == "refusal" {
 				eventType = "response.refusal.done"
-				content = map[string]any{"type": "refusal", "refusal": part.text}
+				content = map[string]any{"type": "refusal", "refusal": partText}
 				delete(payload, "text")
-				payload["refusal"] = part.text
+				payload["refusal"] = partText
 			} else {
 				payload["logprobs"] = part.logprobs
 				content["logprobs"] = part.logprobs
@@ -471,7 +499,7 @@ func (s *streamState) finish() error {
 		}
 	}
 	for _, tool := range s.sortedTools() {
-		if err := s.emitToolPending(tool); err != nil {
+		if err := s.emitToolPending(tool, true); err != nil {
 			return err
 		}
 		if !tool.added {
@@ -480,7 +508,7 @@ func (s *streamState) finish() error {
 		if err := s.writer.event("response.function_call_arguments.done", map[string]any{
 			"item_id":      tool.id,
 			"output_index": tool.outputIndex,
-			"arguments":    tool.arguments,
+			"arguments":    tool.arguments.String(),
 		}); err != nil {
 			return err
 		}
@@ -545,12 +573,13 @@ func (s *streamState) messageItem(status string) map[string]any {
 	content := make([]any, 0, len(s.message.partOrder))
 	for _, kind := range s.message.partOrder {
 		part := s.message.parts[kind]
+		partText := part.text.String()
 		if kind == "refusal" {
-			content = append(content, map[string]any{"type": "refusal", "refusal": part.text})
+			content = append(content, map[string]any{"type": "refusal", "refusal": partText})
 		} else {
 			content = append(content, map[string]any{
 				"type":        "output_text",
-				"text":        part.text,
+				"text":        partText,
 				"annotations": []any{},
 				"logprobs":    part.logprobs,
 			})
@@ -572,7 +601,7 @@ func (t *streamTool) item(status string) map[string]any {
 		"status":    status,
 		"call_id":   t.callID,
 		"name":      t.name,
-		"arguments": t.arguments,
+		"arguments": t.arguments.String(),
 	}
 }
 
@@ -583,7 +612,7 @@ func (s *streamState) finalOutput(status string) []any {
 	}
 	items := make([]indexed, 0, 2+len(s.tools))
 	if s.reasoning != nil && s.reasoning.added {
-		items = append(items, indexed{s.reasoning.outputIndex, reasoningItem(s.reasoning.id, s.reasoning.text, status)})
+		items = append(items, indexed{s.reasoning.outputIndex, reasoningItem(s.reasoning.id, s.reasoning.text.String(), status)})
 	}
 	if s.message != nil {
 		items = append(items, indexed{s.message.outputIndex, s.messageItem(status)})
@@ -618,9 +647,9 @@ func streamLogprobs(value any) any {
 	return logprobs["content"]
 }
 
-func readSSE(input io.Reader, consume func(event, data string) error) error {
+func readSSE(input io.Reader, maxEventBytes int64, consume func(event, data string) error) error {
 	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 64<<10), 64<<20)
+	scanner.Buffer(make([]byte, 64<<10), int(maxEventBytes+(64<<10)))
 	var event string
 	var data bytes.Buffer
 	flush := func() error {
@@ -653,6 +682,9 @@ func readSSE(input io.Reader, consume func(event, data string) error) error {
 		case "event":
 			event = value
 		case "data":
+			if int64(data.Len()+len(value)+1) > maxEventBytes {
+				return fmt.Errorf("upstream SSE event exceeds %d bytes", maxEventBytes)
+			}
 			data.WriteString(value)
 			data.WriteByte('\n')
 		}

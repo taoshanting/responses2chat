@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -86,7 +87,7 @@ func (c Config) ProxyURL() (*url.URL, error) {
 		return nil, nil
 	}
 	parsed, err := url.Parse(c.UpstreamProxyURL)
-	if err != nil || parsed.Host == "" {
+	if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
 		return nil, fmt.Errorf("invalid upstream_proxy_url %q", c.UpstreamProxyURL)
 	}
 	switch parsed.Scheme {
@@ -104,6 +105,24 @@ func (c Config) ValidateServer() error {
 	}
 	if _, err := c.ProxyURL(); err != nil {
 		return err
+	}
+	if c.UpstreamChatCompletionsURL != "" {
+		if err := validateUpstreamURL("upstream_chat_completions_url", c.UpstreamChatCompletionsURL, true); err != nil {
+			return err
+		}
+	} else if err := validateUpstreamURL("upstream_base_url", c.UpstreamBaseURL, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateUpstreamURL(name, raw string, allowQuery bool) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("invalid %s %q: URL must use http or https", name, raw)
+	}
+	if parsed.User != nil || parsed.Fragment != "" || (!allowQuery && parsed.RawQuery != "") {
+		return fmt.Errorf("invalid %s %q: user info, fragments and base URL query strings are not supported", name, raw)
 	}
 	return nil
 }
@@ -129,6 +148,13 @@ func WriteTemplate(path string) error {
 // key order are preserved; the file is rewritten only when something was
 // missing. It returns the JSON paths that were added.
 func Migrate(path string) ([]string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("migrate %s: config must be a regular file", path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -142,10 +168,44 @@ func Migrate(path string) ([]string, error) {
 		return nil, nil
 	}
 	merged = pretty.PrettyOptions(merged, &pretty.Options{Indent: "  "})
-	if err := os.WriteFile(path, merged, 0o644); err != nil {
+	if err := atomicWriteFile(path, merged, info.Mode().Perm()); err != nil {
 		return nil, err
 	}
 	return added, nil
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	if dirHandle, err := os.Open(dir); err == nil {
+		_ = dirHandle.Sync()
+		_ = dirHandle.Close()
+	}
+	return nil
 }
 
 // addMissing walks the template object and appends every key absent from

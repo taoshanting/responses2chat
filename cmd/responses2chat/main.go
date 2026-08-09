@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/lieyan/responses2chat/internal/config"
@@ -76,12 +81,17 @@ func main() {
 		RetryUnsupportedParams: cfg.RetryUnsupportedParamsEnabled(),
 		HTTPClient: &http.Client{
 			Transport: &http.Transport{
-				Proxy:                 proxy,
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 5 * time.Minute,
+				Proxy:                  proxy,
+				DialContext:            (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				ForceAttemptHTTP2:      true,
+				MaxIdleConns:           100,
+				MaxIdleConnsPerHost:    100,
+				MaxConnsPerHost:        128,
+				IdleConnTimeout:        90 * time.Second,
+				TLSHandshakeTimeout:    10 * time.Second,
+				ResponseHeaderTimeout:  5 * time.Minute,
+				ExpectContinueTimeout:  1 * time.Second,
+				MaxResponseHeaderBytes: 64 << 10,
 			},
 		},
 		Logger: log.Default(),
@@ -94,14 +104,62 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
 		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
 	}
 	if proxyURL != nil {
-		log.Printf("responses2chat listening on %s, upstream=%s, proxy=%s", cfg.ListenAddr, upstream, proxyURL.Redacted())
+		log.Printf("responses2chat listening on %s, upstream=%s, proxy=%s", cfg.ListenAddr, endpointForLog(upstream), proxyURL.Redacted())
 	} else {
-		log.Printf("responses2chat listening on %s, upstream=%s", cfg.ListenAddr, upstream)
+		log.Printf("responses2chat listening on %s, upstream=%s", cfg.ListenAddr, endpointForLog(upstream))
 	}
-	log.Fatal(server.ListenAndServe())
+	if err := serve(server); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func serve(server *http.Server) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.ListenAndServe() }()
+
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		log.Printf("shutdown: draining active requests")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	shutdownErr := server.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		_ = server.Close()
+	}
+	serveErr := <-errCh
+	if shutdownErr != nil {
+		return fmt.Errorf("graceful shutdown: %w", shutdownErr)
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return serveErr
+	}
+	return nil
+}
+
+func endpointForLog(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid>"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 // runUpdate implements `responses2chat update`: a synchronous self-update

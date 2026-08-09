@@ -10,15 +10,32 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
+const (
+	defaultMaxBodySize            = int64(32 << 20)
+	defaultMaxUpstreamBodySize    = int64(64 << 20)
+	defaultMaxConcurrentRequests  = 128
+	defaultDownstreamWriteTimeout = 30 * time.Second
+	maxUpstreamErrorBodySize      = int64(1 << 20)
+	maxLogFieldBytes              = 512
+)
+
+var errBodyTooLarge = errors.New("body exceeds configured size limit")
+
 type Config struct {
 	UpstreamURL string
 	MaxBodySize int64
-	HTTPClient  *http.Client
-	Logger      *log.Logger
+	// MaxUpstreamBodySize bounds buffered upstream responses and converted
+	// stream state. Native Chat Completions responses are relayed incrementally.
+	MaxUpstreamBodySize    int64
+	MaxConcurrentRequests  int
+	DownstreamWriteTimeout time.Duration
+	HTTPClient             *http.Client
+	Logger                 *log.Logger
 	// ReasoningPassthrough forwards reasoning Items from Responses input to the
 	// upstream as the non-standard assistant reasoning_content field, and maps
 	// upstream reasoning_content back to Responses reasoning output Items.
@@ -37,15 +54,27 @@ type Handler struct {
 	logger                 *log.Logger
 	reasoningPassthrough   bool
 	retryUnsupportedParams bool
+	requests               chan struct{}
+	maxUpstreamBodySize    int64
+	downstreamWriteTimeout time.Duration
 }
 
 func New(config Config) (*Handler, error) {
 	parsed, err := url.Parse(config.UpstreamURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.Fragment != "" {
 		return nil, fmt.Errorf("invalid upstream URL %q", config.UpstreamURL)
 	}
 	if config.MaxBodySize <= 0 {
-		config.MaxBodySize = 32 << 20
+		config.MaxBodySize = defaultMaxBodySize
+	}
+	if config.MaxUpstreamBodySize <= 0 {
+		config.MaxUpstreamBodySize = defaultMaxUpstreamBodySize
+	}
+	if config.MaxConcurrentRequests <= 0 {
+		config.MaxConcurrentRequests = defaultMaxConcurrentRequests
+	}
+	if config.DownstreamWriteTimeout <= 0 {
+		config.DownstreamWriteTimeout = defaultDownstreamWriteTimeout
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = http.DefaultClient
@@ -60,6 +89,9 @@ func New(config Config) (*Handler, error) {
 		logger:                 config.Logger,
 		reasoningPassthrough:   config.ReasoningPassthrough,
 		retryUnsupportedParams: config.RetryUnsupportedParams,
+		requests:               make(chan struct{}, config.MaxConcurrentRequests),
+		maxUpstreamBodySize:    config.MaxUpstreamBodySize,
+		downstreamWriteTimeout: config.DownstreamWriteTimeout,
 	}, nil
 }
 
@@ -74,7 +106,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.logger.Printf("request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	select {
+	case h.requests <- struct{}{}:
+		defer func() { <-h.requests }()
+	default:
+		writeAPIError(w, http.StatusServiceUnavailable, "server is handling too many concurrent requests", "server_error", "overloaded")
+		return
+	}
+
+	w = &deadlineWriter{ResponseWriter: w, timeout: h.downstreamWriteTimeout}
+	h.logger.Printf("request: %s %s from %s", r.Method, logField(r.URL.Path), logField(r.RemoteAddr))
 	start := time.Now()
 	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 
@@ -87,7 +128,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(recorder, http.StatusNotFound, "route not found", "invalid_request_error", nil)
 	}
 
-	h.logger.Printf("response: %s %s -> %d in %s (%d bytes)", r.Method, r.URL.Path, recorder.status, time.Since(start).Round(time.Millisecond), recorder.bytes)
+	h.logger.Printf("response: %s %s -> %d in %s (%d bytes)", r.Method, logField(r.URL.Path), recorder.status, time.Since(start).Round(time.Millisecond), recorder.bytes)
 }
 
 // statusRecorder captures the status code and body size written by the
@@ -116,6 +157,43 @@ func (s *statusRecorder) Flush() {
 	}
 }
 
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
+// deadlineWriter refreshes the socket write deadline immediately before each
+// write. Long-lived SSE streams remain valid while a client that stops reading
+// cannot hold an upstream connection forever.
+type deadlineWriter struct {
+	http.ResponseWriter
+	timeout time.Duration
+}
+
+func (w *deadlineWriter) setDeadline() {
+	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(w.timeout))
+}
+
+func (w *deadlineWriter) WriteHeader(status int) {
+	w.setDeadline()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *deadlineWriter) Write(p []byte) (int, error) {
+	w.setDeadline()
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *deadlineWriter) Flush() {
+	w.setDeadline()
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *deadlineWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodySize)
 	body, err := io.ReadAll(r.Body)
@@ -134,7 +212,7 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nil)
 		return
 	}
-	h.logger.Printf("responses: model=%v stream=%t", chatRequest["model"], meta.stream)
+	h.logger.Printf("responses: model=%s stream=%t", logField(stringValue(chatRequest["model"])), meta.stream)
 	upstreamBody, err := json.Marshal(chatRequest)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "failed to encode upstream request", "server_error", nil)
@@ -167,11 +245,15 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.retryUnsupportedParams && upstreamResponse.StatusCode == http.StatusBadRequest {
-		errorBody, readErr := io.ReadAll(io.LimitReader(upstreamResponse.Body, h.maxBodySize))
+		errorBody, readErr := readLimited(upstreamResponse.Body, minInt64(h.maxUpstreamBodySize, maxUpstreamErrorBodySize))
 		upstreamResponse.Body.Close()
 		removed := stripUnsupportedParams(chatRequest, errorBody)
 		if readErr != nil || len(removed) == 0 {
 			copyEndToEndHeaders(w.Header(), upstreamResponse.Header)
+			if errors.Is(readErr, errBodyTooLarge) {
+				writeAPIError(w, http.StatusBadGateway, "upstream error response is too large", "upstream_error", "response_too_large")
+				return
+			}
 			writeProxiedError(w, upstreamResponse.StatusCode, errorBody, upstreamResponse.Status)
 			return
 		}
@@ -202,14 +284,18 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(upstreamResponse.StatusCode)
-		if err := convertStream(w, upstreamResponse.Body, meta); err != nil && r.Context().Err() == nil {
-			h.logger.Printf("stream conversion failed: %v", err)
+		if err := convertStream(w, upstreamResponse.Body, meta, h.maxUpstreamBodySize); err != nil && r.Context().Err() == nil {
+			h.logger.Printf("stream conversion failed: %s", logField(err.Error()))
 		}
 		return
 	}
 
-	responseBody, err := io.ReadAll(upstreamResponse.Body)
+	responseBody, err := readLimited(upstreamResponse.Body, h.maxUpstreamBodySize)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			writeAPIError(w, http.StatusBadGateway, "upstream response is too large", "upstream_error", "response_too_large")
+			return
+		}
 		writeAPIError(w, http.StatusBadGateway, "failed to read upstream response", "upstream_error", nil)
 		return
 	}
@@ -282,7 +368,11 @@ func (h *Handler) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) proxyError(w http.ResponseWriter, response *http.Response) {
-	body, err := io.ReadAll(response.Body)
+	body, err := readLimited(response.Body, minInt64(h.maxUpstreamBodySize, maxUpstreamErrorBodySize))
+	if errors.Is(err, errBodyTooLarge) {
+		writeAPIError(w, http.StatusBadGateway, "upstream error response is too large", "upstream_error", "response_too_large")
+		return
+	}
 	if err != nil {
 		body = nil
 	}
@@ -305,13 +395,34 @@ func writeProxiedError(w http.ResponseWriter, status int, body []byte, statusTex
 
 var quotedParamPattern = regexp.MustCompile("[`'\"]([A-Za-z0-9_]+)[`'\"]")
 
+var retryableUnsupportedParams = map[string]struct{}{
+	"metadata":         {},
+	"prompt_cache_key": {},
+	"service_tier":     {},
+}
+
 // stripUnsupportedParams looks for upstream 400 messages of the form
 // "Unsupported parameter(s): `prompt_cache_key`" (or "Unknown parameter:
-// 'user'"), deletes the named top-level fields from request, and returns
-// the removed names. Fields the request cannot function without are never
-// removed.
+// 'metadata'"), deletes explicitly allowlisted operational hints from request,
+// and returns the removed names. Output-affecting and safety fields are never
+// silently downgraded.
 func stripUnsupportedParams(request map[string]any, errorBody []byte) []string {
-	text := string(errorBody)
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(errorBody, &envelope)
+
+	candidates := make([]string, 0, 2)
+	if envelope.Error.Param != "" {
+		candidates = append(candidates, envelope.Error.Param)
+	}
+	text := envelope.Error.Message
+	if text == "" {
+		text = string(errorBody)
+	}
 	lower := strings.ToLower(text)
 	idx := strings.Index(lower, "unsupported parameter")
 	if idx < 0 {
@@ -320,18 +431,56 @@ func stripUnsupportedParams(request map[string]any, errorBody []byte) []string {
 	if idx < 0 {
 		return nil
 	}
+	if len(candidates) == 0 {
+		clause := text[idx:]
+		if end := strings.IndexAny(clause, ".!?;\n"); end >= 0 {
+			clause = clause[:end]
+		}
+		for _, match := range quotedParamPattern.FindAllStringSubmatch(clause, -1) {
+			candidates = append(candidates, match[1])
+		}
+	}
 	var removed []string
-	for _, match := range quotedParamPattern.FindAllStringSubmatch(text[idx:], -1) {
-		name := match[1]
-		if name == "model" || name == "messages" || name == "stream" {
+	seen := make(map[string]struct{}, len(candidates))
+	for _, name := range candidates {
+		if _, ok := retryableUnsupportedParams[name]; !ok {
 			continue
 		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
 		if _, ok := request[name]; ok {
 			delete(request, name)
 			removed = append(removed, name)
 		}
 	}
 	return removed
+}
+
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errBodyTooLarge
+	}
+	return data, nil
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func logField(value string) string {
+	if len(value) > maxLogFieldBytes {
+		value = value[:maxLogFieldBytes] + "..."
+	}
+	return strconv.QuoteToASCII(value)
 }
 
 func writeAPIError(w http.ResponseWriter, status int, message, errorType string, code any) {
