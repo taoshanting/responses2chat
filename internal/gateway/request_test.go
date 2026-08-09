@@ -268,6 +268,50 @@ func TestConvertRequestRejectsMalformedToolsAndChoices(t *testing.T) {
 	}
 }
 
+func TestConvertRequestRejectsMalformedTopLevelOptions(t *testing.T) {
+	tests := []struct {
+		name     string
+		fields   string
+		wantPath string
+	}{
+		{name: "string stream", fields: `"stream":"true"`, wantPath: "stream"},
+		{name: "null stream", fields: `"stream":null`, wantPath: "stream"},
+		{name: "invalid instructions", fields: `"instructions":7`, wantPath: "instructions"},
+		{name: "invalid reasoning", fields: `"reasoning":7`, wantPath: "reasoning"},
+		{name: "invalid effort", fields: `"reasoning":{"effort":7}`, wantPath: "reasoning.effort"},
+		{name: "invalid text", fields: `"text":7`, wantPath: "text"},
+		{name: "invalid verbosity", fields: `"text":{"verbosity":7}`, wantPath: "text.verbosity"},
+		{name: "invalid format", fields: `"text":{"format":7}`, wantPath: "text.format"},
+		{name: "missing format type", fields: `"text":{"format":{}}`, wantPath: "text.format.type"},
+		{name: "missing schema name", fields: `"text":{"format":{"type":"json_schema","schema":{}}}`, wantPath: "text.format.name"},
+		{name: "missing schema", fields: `"text":{"format":{"type":"json_schema","name":"answer"}}`, wantPath: "text.format.schema"},
+		{name: "invalid schema", fields: `"text":{"format":{"type":"json_schema","name":"answer","schema":7}}`, wantPath: "text.format.schema"},
+		{
+			name:     "invalid schema strictness",
+			fields:   `"text":{"format":{"type":"json_schema","name":"answer","schema":{},"strict":"true"}}`,
+			wantPath: "text.format.strict",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"m","input":"hi",` + tc.fields + `}`)
+			if _, _, err := convertRequest(body, false); err == nil || !strings.Contains(err.Error(), tc.wantPath) {
+				t.Fatalf("error=%v, want path %q", err, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestConvertRequestIgnoresUnknownFutureTextFormat(t *testing.T) {
+	got, _, err := convertRequest([]byte(`{"model":"m","input":"hi","text":{"format":{"type":"future_format","option":7}}}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := got["response_format"]; exists {
+		t.Fatalf("unknown response format leaked upstream: %#v", got["response_format"])
+	}
+}
+
 func TestConvertRequestStillDropsUnknownItemsAndParts(t *testing.T) {
 	got, _, err := convertRequest([]byte(`{
   "model":"m",

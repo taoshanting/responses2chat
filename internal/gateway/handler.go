@@ -21,6 +21,7 @@ const (
 	defaultMaxUpstreamBodySize     = int64(32 << 20)
 	defaultMaxConcurrentRequests   = 16
 	defaultDownstreamWriteTimeout  = 30 * time.Second
+	defaultUpstreamReadIdleTimeout = 5 * time.Minute
 	defaultBufferedUpstreamTimeout = 10 * time.Minute
 	maxUpstreamErrorBodySize       = int64(1 << 20)
 	maxLogFieldBytes               = 512
@@ -36,8 +37,11 @@ type Config struct {
 	MaxUpstreamBodySize    int64
 	MaxConcurrentRequests  int
 	DownstreamWriteTimeout time.Duration
-	HTTPClient             *http.Client
-	Logger                 *log.Logger
+	// UpstreamReadIdleTimeout bounds each individual blocking response-body
+	// read without imposing a total lifetime on streaming responses.
+	UpstreamReadIdleTimeout time.Duration
+	HTTPClient              *http.Client
+	Logger                  *log.Logger
 	// ReasoningPassthrough forwards reasoning Items from Responses input to the
 	// upstream as the non-standard assistant reasoning_content field, and maps
 	// upstream reasoning_content back to Responses reasoning output Items.
@@ -50,15 +54,16 @@ type Config struct {
 }
 
 type Handler struct {
-	upstreamURL            string
-	maxBodySize            int64
-	client                 *http.Client
-	logger                 *log.Logger
-	reasoningPassthrough   bool
-	retryUnsupportedParams bool
-	requests               chan struct{}
-	maxUpstreamBodySize    int64
-	downstreamWriteTimeout time.Duration
+	upstreamURL             string
+	maxBodySize             int64
+	client                  *http.Client
+	logger                  *log.Logger
+	reasoningPassthrough    bool
+	retryUnsupportedParams  bool
+	requests                chan struct{}
+	maxUpstreamBodySize     int64
+	downstreamWriteTimeout  time.Duration
+	upstreamReadIdleTimeout time.Duration
 }
 
 func New(config Config) (*Handler, error) {
@@ -78,6 +83,9 @@ func New(config Config) (*Handler, error) {
 	if config.DownstreamWriteTimeout <= 0 {
 		config.DownstreamWriteTimeout = defaultDownstreamWriteTimeout
 	}
+	if config.UpstreamReadIdleTimeout <= 0 {
+		config.UpstreamReadIdleTimeout = defaultUpstreamReadIdleTimeout
+	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = http.DefaultClient
 	}
@@ -89,15 +97,16 @@ func New(config Config) (*Handler, error) {
 		return http.ErrUseLastResponse
 	}
 	return &Handler{
-		upstreamURL:            parsed.String(),
-		maxBodySize:            config.MaxBodySize,
-		client:                 &client,
-		logger:                 config.Logger,
-		reasoningPassthrough:   config.ReasoningPassthrough,
-		retryUnsupportedParams: config.RetryUnsupportedParams,
-		requests:               make(chan struct{}, config.MaxConcurrentRequests),
-		maxUpstreamBodySize:    config.MaxUpstreamBodySize,
-		downstreamWriteTimeout: config.DownstreamWriteTimeout,
+		upstreamURL:             parsed.String(),
+		maxBodySize:             config.MaxBodySize,
+		client:                  &client,
+		logger:                  config.Logger,
+		reasoningPassthrough:    config.ReasoningPassthrough,
+		retryUnsupportedParams:  config.RetryUnsupportedParams,
+		requests:                make(chan struct{}, config.MaxConcurrentRequests),
+		maxUpstreamBodySize:     config.MaxUpstreamBodySize,
+		downstreamWriteTimeout:  config.DownstreamWriteTimeout,
+		upstreamReadIdleTimeout: config.UpstreamReadIdleTimeout,
 	}, nil
 }
 
@@ -267,7 +276,7 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 		} else {
 			upstreamRequest.Header.Set("Accept", "application/json")
 		}
-		return h.client.Do(upstreamRequest)
+		return h.doUpstream(upstreamRequest)
 	}
 
 	upstreamResponse, err := sendUpstream(upstreamBody)
@@ -381,7 +390,7 @@ func (h *Handler) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 		upstreamRequest.Header.Set("Accept-Encoding", "identity")
 	}
 
-	upstreamResponse, err := h.client.Do(upstreamRequest)
+	upstreamResponse, err := h.doUpstream(upstreamRequest)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return

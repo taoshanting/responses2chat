@@ -82,6 +82,7 @@ const (
 	idleWaitTimeout  = 10 * time.Minute
 	idlePollInterval = 5 * time.Second
 	downloadTimeout  = 30 * time.Minute
+	staleTempAge     = downloadTimeout + time.Minute
 	maxBinarySize    = 256 << 20
 	maxReleaseSize   = 1 << 20
 	maxManifestSize  = 64 << 10
@@ -866,6 +867,9 @@ func (u *Updater) download(ctx context.Context, cfg Config, release *releaseInfo
 	if err := os.Chmod(updateDir, 0o700); err != nil {
 		return "", fmt.Errorf("secure update dir: %w", err)
 	}
+	if err := cleanupStaleUpdateTemps(updateDir, time.Now()); err != nil {
+		return "", fmt.Errorf("clean stale update downloads: %w", err)
+	}
 
 	finalName := "responses2chat-" + sanitizePathPart(release.TagName)
 	if runtime.GOOS == "windows" {
@@ -943,6 +947,33 @@ func (u *Updater) download(ctx context.Context, cfg Config, release *releaseInfo
 
 	u.logger.Printf("update: downloaded %s to %s", release.TagName, finalPath)
 	return finalPath, nil
+}
+
+func cleanupStaleUpdateTemps(updateDir string, now time.Time) error {
+	entries, err := os.ReadDir(updateDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, ".responses2chat-") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if !info.Mode().IsRegular() || now.Sub(info.ModTime()) < staleTempAge {
+			continue
+		}
+		if err := os.Remove(filepath.Join(updateDir, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 // resolveDownloadURL maps a GitHub browser_download_url onto the proxy

@@ -841,6 +841,43 @@ func TestDownloadFileRefusesExistingOrLinkedDestination(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleUpdateTemps(t *testing.T) {
+	updateDir := t.TempDir()
+	now := time.Now()
+	old := now.Add(-staleTempAge - time.Second)
+
+	write := func(name string, modified time.Time) string {
+		t.Helper()
+		path := filepath.Join(updateDir, name)
+		if err := os.WriteFile(path, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	stale := write(".responses2chat-v1.2.3-123.tmp", old)
+	fresh := write(".responses2chat-v1.2.3-456.tmp", now)
+	unrelated := write("other.tmp", old)
+	matchingDir := filepath.Join(updateDir, ".responses2chat-directory.tmp")
+	if err := os.Mkdir(matchingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanupStaleUpdateTemps(updateDir, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale update temp still exists: %v", err)
+	}
+	for _, path := range []string{fresh, unrelated, matchingDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preserved path %s: %v", path, err)
+		}
+	}
+}
+
 func TestDevVersionComparisonIsMonotonic(t *testing.T) {
 	originalVersion := version.Version
 	defer func() { version.Version = originalVersion }()

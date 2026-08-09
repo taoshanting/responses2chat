@@ -93,7 +93,7 @@ func main() {
 					if err != nil {
 						return nil, err
 					}
-					return &deadlineConn{Conn: conn, readTimeout: 5 * time.Minute, writeTimeout: time.Minute}, nil
+					return &writeDeadlineConn{Conn: conn, writeTimeout: time.Minute}, nil
 				},
 				ForceAttemptHTTP2:      true,
 				MaxIdleConns:           100,
@@ -163,19 +163,12 @@ func serve(server *http.Server) error {
 	return nil
 }
 
-type deadlineConn struct {
+type writeDeadlineConn struct {
 	net.Conn
-	readTimeout  time.Duration
 	writeTimeout time.Duration
 }
 
-func (c *deadlineConn) Read(p []byte) (int, error) {
-	_ = c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout))
-	defer c.Conn.SetReadDeadline(time.Time{})
-	return c.Conn.Read(p)
-}
-
-func (c *deadlineConn) Write(p []byte) (int, error) {
+func (c *writeDeadlineConn) Write(p []byte) (int, error) {
 	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	defer c.Conn.SetWriteDeadline(time.Time{})
 	return c.Conn.Write(p)
@@ -238,7 +231,8 @@ func runUpdate(args []string) {
 		updater.RestartHooks{},
 	)
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if *checkOnly {
 		result, err := u.CheckOnly(ctx)
 		if err != nil {

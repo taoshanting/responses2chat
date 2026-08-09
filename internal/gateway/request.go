@@ -42,7 +42,11 @@ func convertRequest(body []byte, reasoningPassthrough bool) (map[string]any, req
 	dst["store"] = false
 
 	messages := make([]any, 0)
-	if instructions, ok := src["instructions"].(string); ok {
+	if rawInstructions, exists := src["instructions"]; exists && rawInstructions != nil {
+		instructions, ok := rawInstructions.(string)
+		if !ok {
+			return nil, requestMeta{}, errors.New("instructions must be a string or null")
+		}
 		messages = append(messages, map[string]any{
 			"role":    "developer",
 			"content": instructions,
@@ -64,17 +68,39 @@ func convertRequest(body []byte, reasoningPassthrough bool) (map[string]any, req
 		dst["top_logprobs"] = topLogprobs
 		dst["logprobs"] = true
 	}
-	if reasoning, ok := object(src["reasoning"]); ok {
+	if rawReasoning, exists := src["reasoning"]; exists && rawReasoning != nil {
+		reasoning, ok := object(rawReasoning)
+		if !ok {
+			return nil, requestMeta{}, errors.New("reasoning must be an object or null")
+		}
 		if effort, ok := reasoning["effort"]; ok && effort != nil {
+			if _, ok := effort.(string); !ok {
+				return nil, requestMeta{}, errors.New("reasoning.effort must be a string or null")
+			}
 			dst["reasoning_effort"] = effort
 		}
 	}
-	if text, ok := object(src["text"]); ok {
+	if rawText, exists := src["text"]; exists && rawText != nil {
+		text, ok := object(rawText)
+		if !ok {
+			return nil, requestMeta{}, errors.New("text must be an object or null")
+		}
 		if verbosity, ok := text["verbosity"]; ok && verbosity != nil {
+			if _, ok := verbosity.(string); !ok {
+				return nil, requestMeta{}, errors.New("text.verbosity must be a string or null")
+			}
 			dst["verbosity"] = verbosity
 		}
-		if format, ok := object(text["format"]); ok {
-			if converted, ok := convertTextFormat(format); ok {
+		if rawFormat, exists := text["format"]; exists && rawFormat != nil {
+			format, ok := object(rawFormat)
+			if !ok {
+				return nil, requestMeta{}, errors.New("text.format must be an object or null")
+			}
+			converted, convertedOK, err := convertTextFormat(format)
+			if err != nil {
+				return nil, requestMeta{}, err
+			}
+			if convertedOK {
 				dst["response_format"] = converted
 			}
 		}
@@ -97,12 +123,18 @@ func convertRequest(body []byte, reasoningPassthrough bool) (map[string]any, req
 		meta.appliedToolChoice = choice.responses
 	}
 
-	if stream, _ := src["stream"].(bool); stream {
-		meta.stream = true
-		dst["stream"] = true
+	if rawStream, exists := src["stream"]; exists {
+		stream, ok := rawStream.(bool)
+		if !ok {
+			return nil, requestMeta{}, errors.New("stream must be a boolean")
+		}
+		meta.stream = stream
+		dst["stream"] = stream
 		// Responses requires usage in its terminal event. Chat streams only send it
 		// when explicitly requested.
-		dst["stream_options"] = map[string]any{"include_usage": true}
+		if stream {
+			dst["stream_options"] = map[string]any{"include_usage": true}
+		}
 	}
 
 	return dst, meta, nil
@@ -640,21 +672,40 @@ func convertToolChoice(value any, tools convertedTools) (convertedChoice, bool, 
 	}, true, nil
 }
 
-func convertTextFormat(format map[string]any) (map[string]any, bool) {
-	formatType, _ := format["type"].(string)
+func convertTextFormat(format map[string]any) (map[string]any, bool, error) {
+	formatType, ok := format["type"].(string)
+	if !ok || formatType == "" {
+		return nil, false, errors.New("text.format.type must be a non-empty string")
+	}
 	switch formatType {
-	case "", "text":
-		return nil, false
+	case "text":
+		return nil, false, nil
 	case "json_object":
-		return map[string]any{"type": "json_object"}, true
+		return map[string]any{"type": "json_object"}, true, nil
 	case "json_schema":
-		schema := make(map[string]any)
-		copyFields(format, schema, "name", "description", "schema", "strict")
-		if schema["name"] == nil || schema["schema"] == nil {
-			return nil, false
+		name, ok := format["name"].(string)
+		if !ok || name == "" {
+			return nil, false, errors.New("text.format.name must be a non-empty string for json_schema")
 		}
-		return map[string]any{"type": "json_schema", "json_schema": schema}, true
+		definition, ok := object(format["schema"])
+		if !ok {
+			return nil, false, errors.New("text.format.schema must be an object for json_schema")
+		}
+		schema := map[string]any{"name": name, "schema": definition}
+		if description, exists := format["description"]; exists && description != nil {
+			if _, ok := description.(string); !ok {
+				return nil, false, errors.New("text.format.description must be a string or null")
+			}
+			schema["description"] = description
+		}
+		if strict, exists := format["strict"]; exists && strict != nil {
+			if _, ok := strict.(bool); !ok {
+				return nil, false, errors.New("text.format.strict must be a boolean or null")
+			}
+			schema["strict"] = strict
+		}
+		return map[string]any{"type": "json_schema", "json_schema": schema}, true, nil
 	default:
-		return nil, false
+		return nil, false, nil
 	}
 }
