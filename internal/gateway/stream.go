@@ -399,7 +399,7 @@ func (s *streamState) ensurePart(kind string) (*streamMessage, *streamPart, erro
 	}
 	if !part.added {
 		part.added = true
-		payload := map[string]any{}
+		var payload map[string]any
 		if kind == "output_text" {
 			payload = map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
 		} else {

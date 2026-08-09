@@ -282,7 +282,7 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 
 	if h.retryUnsupportedParams && upstreamResponse.StatusCode == http.StatusBadRequest {
 		errorBody, readErr := readLimited(upstreamResponse.Body, minInt64(h.maxUpstreamBodySize, maxUpstreamErrorBodySize))
-		upstreamResponse.Body.Close()
+		_ = upstreamResponse.Body.Close()
 		removed := stripUnsupportedParams(chatRequest, errorBody)
 		if readErr != nil || len(removed) == 0 {
 			copyEndToEndHeaders(w.Header(), upstreamResponse.Header)
