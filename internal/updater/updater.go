@@ -1269,12 +1269,16 @@ func (u *Updater) applyUpdateUnix(newBinaryPath, tag string) error {
 }
 
 func installBinaryUnix(newBinaryPath, execPath string) (string, error) {
+	info, err := os.Stat(execPath)
+	if err != nil {
+		return "", fmt.Errorf("stat current binary: %w", err)
+	}
 	backupPath := execPath + ".bak"
 	// On Unix, rename atomically replaces a stale regular-file backup.
 	if err := os.Rename(execPath, backupPath); err != nil {
 		return "", fmt.Errorf("backup current binary: %w", err)
 	}
-	if err := copyFile(newBinaryPath, execPath, 0o755); err != nil {
+	if err := copyFile(newBinaryPath, execPath, info.Mode().Perm()); err != nil {
 		return "", rollbackBinary(execPath, backupPath, fmt.Errorf("install new binary: %w", err))
 	}
 	return backupPath, nil

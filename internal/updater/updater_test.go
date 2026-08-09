@@ -514,7 +514,7 @@ func TestInstallBinaryUnixReplacesStaleBackup(t *testing.T) {
 	execPath := filepath.Join(dir, "responses2chat")
 	backupPath := execPath + ".bak"
 	newBinaryPath := filepath.Join(dir, "responses2chat-new")
-	if err := os.WriteFile(execPath, []byte("current"), 0o755); err != nil {
+	if err := os.WriteFile(execPath, []byte("current"), 0o750); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(backupPath, []byte("stale"), 0o755); err != nil {
@@ -537,8 +537,8 @@ func TestInstallBinaryUnixReplacesStaleBackup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o755 {
-		t.Fatalf("installed mode = %o, want 755", got)
+	if got := info.Mode().Perm(); got != 0o750 {
+		t.Fatalf("installed mode = %o, want 750", got)
 	}
 }
 
