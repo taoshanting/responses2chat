@@ -132,7 +132,11 @@ func (u *Updater) Status() Status {
 }
 
 func (u *Updater) CheckOnly(ctx context.Context) (CheckResult, error) {
-	cfg := normalizeConfig(u.cfg())
+	rawCfg := u.cfg()
+	if err := ValidateConfig(rawCfg); err != nil {
+		return CheckResult{}, err
+	}
+	cfg := normalizeConfig(rawCfg)
 	result := CheckResult{
 		CurrentVersion: version.Version,
 		Channel:        cfg.Channel,
@@ -221,7 +225,12 @@ func (u *Updater) DismissPending() {
 }
 
 func (u *Updater) StartBackground(ctx context.Context) {
-	cfg := normalizeConfig(u.cfg())
+	rawCfg := u.cfg()
+	if err := ValidateConfig(rawCfg); err != nil {
+		u.logger.Printf("update: invalid configuration: %v", err)
+		return
+	}
+	cfg := normalizeConfig(rawCfg)
 	if !cfg.Enabled {
 		u.logger.Printf("update: disabled")
 		return
@@ -271,7 +280,12 @@ func (u *Updater) checkAndUpdate(ctx context.Context) {
 }
 
 func (u *Updater) performUpdate(ctx context.Context) {
-	cfg := normalizeConfig(u.cfg())
+	rawCfg := u.cfg()
+	if err := ValidateConfig(rawCfg); err != nil {
+		u.setError("invalid configuration: " + err.Error())
+		return
+	}
+	cfg := normalizeConfig(rawCfg)
 
 	u.mu.Lock()
 	if u.status.State == "checking" || u.status.State == "ready" || u.status.State == "downloading" || u.status.State == "applying" {
@@ -948,9 +962,9 @@ func (u *Updater) resolveDownloadURL(cfg Config, tag string, asset *assetInfo) (
 	if parsed.Path != expectedPath {
 		return "", fmt.Errorf("asset %s URL path %q does not match %q", asset.Name, parsed.Path, expectedPath)
 	}
-	proxy, err := url.Parse(cfg.ProxyBaseURL)
-	if err != nil || (proxy.Scheme != "http" && proxy.Scheme != "https") || proxy.Host == "" || proxy.User != nil || proxy.RawQuery != "" || proxy.Fragment != "" {
-		return "", fmt.Errorf("invalid proxy_base_url %q", cfg.ProxyBaseURL)
+	proxy, err := parseProxyBaseURL(cfg.ProxyBaseURL)
+	if err != nil {
+		return "", err
 	}
 	proxy.Path = strings.TrimRight(proxy.Path, "/") + "/download/" + owner + "/" + repo + "/" + tag + "/" + asset.Name
 	proxy.RawPath = ""
@@ -1373,6 +1387,37 @@ func normalizeConfig(cfg Config) Config {
 	}
 	cfg.AdminToken = strings.TrimSpace(cfg.AdminToken)
 	return cfg
+}
+
+// ValidateConfig rejects misspelled release policies instead of silently
+// switching channels or bypassing an explicitly requested mirror.
+func ValidateConfig(cfg Config) error {
+	channel := strings.ToLower(strings.TrimSpace(cfg.Channel))
+	if channel != "" && channel != "stable" && channel != "dev" {
+		return fmt.Errorf("invalid update channel %q: must be stable or dev", cfg.Channel)
+	}
+	source := strings.ToLower(strings.TrimSpace(cfg.Source))
+	if source != "" && source != SourceGitHub && source != SourceProxy {
+		return fmt.Errorf("invalid update source %q: must be github or proxy", cfg.Source)
+	}
+	normalized := normalizeConfig(cfg)
+	if _, _, err := splitRepo(normalized.Repo); err != nil {
+		return err
+	}
+	if normalized.Source == SourceProxy {
+		if _, err := parseProxyBaseURL(normalized.ProxyBaseURL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseProxyBaseURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return nil, fmt.Errorf("invalid proxy_base_url")
+	}
+	return parsed, nil
 }
 
 func sanitizePathPart(value string) string {

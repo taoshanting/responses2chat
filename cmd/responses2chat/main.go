@@ -8,10 +8,10 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -59,6 +59,11 @@ func main() {
 	if err := cfg.ValidateServer(); err != nil {
 		log.Fatalf("config %s: %v", *configPath, err)
 	}
+	if runtime.GOOS != "windows" {
+		if info, statErr := os.Stat(*configPath); statErr == nil && info.Mode().Perm()&0o077 != 0 {
+			log.Printf("warning: config %q permissions %04o allow access by other users; use 0600 if it contains proxy credentials", *configPath, info.Mode().Perm())
+		}
+	}
 
 	upstream := cfg.UpstreamChatCompletionsURL
 	if upstream == "" {
@@ -74,6 +79,7 @@ func main() {
 		proxy = http.ProxyURL(proxyURL)
 	}
 
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	handler, err := gateway.New(gateway.Config{
 		UpstreamURL:            upstream,
 		MaxBodySize:            32 << 20,
@@ -81,8 +87,14 @@ func main() {
 		RetryUnsupportedParams: cfg.RetryUnsupportedParamsEnabled(),
 		HTTPClient: &http.Client{
 			Transport: &http.Transport{
-				Proxy:                  proxy,
-				DialContext:            (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				Proxy: proxy,
+				DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+					conn, err := dialer.DialContext(ctx, network, address)
+					if err != nil {
+						return nil, err
+					}
+					return &deadlineConn{Conn: conn, readTimeout: 5 * time.Minute, writeTimeout: time.Minute}, nil
+				},
 				ForceAttemptHTTP2:      true,
 				MaxIdleConns:           100,
 				MaxIdleConnsPerHost:    100,
@@ -109,9 +121,9 @@ func main() {
 		MaxHeaderBytes:    64 << 10,
 	}
 	if proxyURL != nil {
-		log.Printf("responses2chat listening on %s, upstream=%s, proxy=%s", cfg.ListenAddr, endpointForLog(upstream), proxyURL.Redacted())
+		log.Printf("responses2chat listening on %s, upstream=%s, proxy=%s", cfg.ListenAddr, config.URLForLog(upstream), config.URLForLog(proxyURL.String()))
 	} else {
-		log.Printf("responses2chat listening on %s, upstream=%s", cfg.ListenAddr, endpointForLog(upstream))
+		log.Printf("responses2chat listening on %s, upstream=%s", cfg.ListenAddr, config.URLForLog(upstream))
 	}
 	if err := serve(server); err != nil {
 		log.Fatal(err)
@@ -151,15 +163,22 @@ func serve(server *http.Server) error {
 	return nil
 }
 
-func endpointForLog(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return "<invalid>"
-	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String()
+type deadlineConn struct {
+	net.Conn
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+}
+
+func (c *deadlineConn) Read(p []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+	defer c.Conn.SetReadDeadline(time.Time{})
+	return c.Conn.Read(p)
+}
+
+func (c *deadlineConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	defer c.Conn.SetWriteDeadline(time.Time{})
+	return c.Conn.Write(p)
 }
 
 // runUpdate implements `responses2chat update`: a synchronous self-update
@@ -208,6 +227,9 @@ func runUpdate(args []string) {
 		Source:       upd.Source,
 		ProxyBaseURL: upd.ProxyBaseURL,
 		Repo:         upd.Repo,
+	}
+	if err := updater.ValidateConfig(cfg); err != nil {
+		log.Fatalf("update config: %v", err)
 	}
 	u := updater.New(
 		func() updater.Config { return cfg },

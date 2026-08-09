@@ -87,14 +87,14 @@ func (c Config) ProxyURL() (*url.URL, error) {
 		return nil, nil
 	}
 	parsed, err := url.Parse(c.UpstreamProxyURL)
-	if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
-		return nil, fmt.Errorf("invalid upstream_proxy_url %q", c.UpstreamProxyURL)
+	if err != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return nil, fmt.Errorf("invalid upstream_proxy_url %q", URLForLog(c.UpstreamProxyURL))
 	}
 	switch parsed.Scheme {
 	case "http", "https", "socks5", "socks5h":
 		return parsed, nil
 	default:
-		return nil, fmt.Errorf("upstream_proxy_url %q: scheme must be http, https, socks5 or socks5h", c.UpstreamProxyURL)
+		return nil, fmt.Errorf("upstream_proxy_url %q: scheme must be http, https, socks5 or socks5h", URLForLog(c.UpstreamProxyURL))
 	}
 }
 
@@ -119,18 +119,32 @@ func (c Config) ValidateServer() error {
 func validateUpstreamURL(name, raw string, allowQuery bool) error {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return fmt.Errorf("invalid %s %q: URL must use http or https", name, raw)
+		return fmt.Errorf("invalid %s %q: URL must use http or https", name, URLForLog(raw))
 	}
-	if parsed.User != nil || parsed.Fragment != "" || (!allowQuery && parsed.RawQuery != "") {
-		return fmt.Errorf("invalid %s %q: user info, fragments and base URL query strings are not supported", name, raw)
+	if parsed.User != nil || parsed.Fragment != "" || parsed.ForceQuery || (!allowQuery && parsed.RawQuery != "") {
+		return fmt.Errorf("invalid %s %q: user info, fragments and base URL query strings are not supported", name, URLForLog(raw))
 	}
 	return nil
+}
+
+// URLForLog removes credentials and query parameters before a configured URL
+// is included in errors or logs.
+func URLForLog(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid>"
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 // WriteTemplate writes the embedded template to path, refusing to touch an
 // existing file.
 func WriteTemplate(path string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}

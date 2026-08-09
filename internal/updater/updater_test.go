@@ -834,6 +834,27 @@ func TestNormalizeConfigInvalidChannelDefaultsToStable(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsInvalidPolicies(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{name: "channel", cfg: Config{Channel: "dve"}},
+		{name: "source", cfg: Config{Source: "proxi"}},
+		{name: "repo", cfg: Config{Repo: "owner/repo/extra"}},
+		{name: "proxy credentials", cfg: Config{Source: SourceProxy, ProxyBaseURL: "https://user:secret@mirror.example"}},
+		{name: "proxy query", cfg: Config{Source: SourceProxy, ProxyBaseURL: "https://mirror.example?"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateConfig(tc.cfg); err == nil {
+				t.Fatal("expected invalid update configuration to be rejected")
+			} else if strings.Contains(err.Error(), "secret") {
+				t.Fatalf("validation error leaked credentials: %v", err)
+			}
+		})
+	}
+}
+
 func setTestSigningKey(t *testing.T) func(data []byte) string {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)

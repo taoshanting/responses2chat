@@ -31,11 +31,14 @@ func (w *eventWriter) event(eventType string, data map[string]any) error {
 	data["type"] = eventType
 	data["sequence_number"] = w.sequence
 	w.sequence++
-	payload, err := json.Marshal(data)
-	if err != nil {
+	var payload bytes.Buffer
+	encoder := json.NewEncoder(&payload)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(data); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w.w, "event: %s\ndata: %s\n\n", eventType, payload); err != nil {
+	encoded := bytes.TrimSuffix(payload.Bytes(), []byte{'\n'})
+	if _, err := fmt.Fprintf(w.w, "event: %s\ndata: %s\n\n", eventType, encoded); err != nil {
 		return err
 	}
 	w.flusher.Flush()

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -16,6 +18,15 @@ func TestTemplateIsValidAndExtractable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := WriteTemplate(path); err != nil {
 		t.Fatalf("WriteTemplate: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("template mode = %04o, want 0600", got)
+		}
 	}
 	loaded, err := Load(path)
 	if err != nil {
@@ -91,6 +102,7 @@ func TestProxyURL(t *testing.T) {
 		{"socks5h", "socks5h://127.0.0.1:1080", false},
 		{"path", "https://proxy.example/mirror", true},
 		{"query", "https://proxy.example?token=secret", true},
+		{"empty query", "https://proxy.example?", true},
 		{"fragment", "https://proxy.example#fragment", true},
 		{"unsupported scheme", "ftp://127.0.0.1:21", true},
 		{"missing host", "http://", true},
@@ -107,6 +119,9 @@ func TestProxyURL(t *testing.T) {
 				if cfg.ValidateServer() == nil {
 					t.Fatalf("ValidateServer must reject upstream_proxy_url %q", tc.raw)
 				}
+				if err != nil && strings.Contains(err.Error(), "secret") {
+					t.Fatalf("ProxyURL error leaked credentials: %v", err)
+				}
 				return
 			}
 			if err != nil {
@@ -122,16 +137,29 @@ func TestProxyURL(t *testing.T) {
 	}
 }
 
+func TestURLForLogRemovesCredentialsAndQuery(t *testing.T) {
+	got := URLForLog("https://user:secret@proxy.example/path?token=private#fragment")
+	if got != "https://proxy.example/path" {
+		t.Fatalf("URLForLog = %q", got)
+	}
+	if got := URLForLog("://bad"); got != "<invalid>" {
+		t.Fatalf("invalid URL log value = %q", got)
+	}
+}
+
 func TestValidateServerRejectsUnsafeUpstreamURLs(t *testing.T) {
 	for _, raw := range []string{
 		"ftp://up.example/v1",
 		"https://user:secret@up.example/v1",
 		"https://up.example/v1?token=secret",
 		"https://up.example/v1#fragment",
+		"https://up.example/v1?",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			if err := (Config{UpstreamBaseURL: raw}).ValidateServer(); err == nil {
 				t.Fatalf("ValidateServer accepted %q", raw)
+			} else if strings.Contains(err.Error(), "secret") {
+				t.Fatalf("ValidateServer error leaked credentials: %v", err)
 			}
 		})
 	}

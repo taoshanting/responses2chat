@@ -22,11 +22,11 @@ Completions 使用 messages。无法由 Chat Completions 忠实表达的字段�
 
 ## 启动
 
-要求 Go 1.24 或更高版本。全部配置统一放在 `config.json`，不读取任何配置类
+要求 Go 1.26.5 或更高版本。全部配置统一放在 `config.json`，不读取任何配置类
 环境变量。
 
 首次启动时若 `config.json` 不存在，程序会把打包在二进制内的模板释放到该
-路径并退出；填写上游地址后再次启动即可：
+路径并以 `0600` 权限退出；填写上游地址后再次启动即可：
 
 ```bash
 go run ./cmd/responses2chat   # 首次运行：生成 ./config.json 后退出
@@ -54,7 +54,7 @@ go run ./cmd/responses2chat   # 正式启动
     "channel": "stable",
     "source": "github",
     "proxy_base_url": "",
-    "repo": ""
+    "repo": "lieyanc/responses2chat"
   }
 }
 ```
@@ -74,6 +74,15 @@ go run ./cmd/responses2chat   # 正式启动
 只移除 HTTP hop-by-hop 头并重新计算 `Content-Length`。
 
 健康检查：`GET /healthz`。
+
+默认资源边界：请求体、转换后的普通响应和单条流式请求累计状态均最大 32 MiB，
+上游错误体最大 1 MiB；同时处理 16 个请求，超出时返回 503。服务端请求头上限为
+64 KiB，并限制慢速读头、请求体读取、上游响应头等待、上游读写空闲和每次下游写入；
+非流式转换请求还有 10 分钟总上限。收到 SIGINT/SIGTERM 后最多等待 30 秒排空在途
+请求。Chat Completions 成功响应保持逐块透传，不为限流而整包缓冲。
+
+若代理 URL 含凭据，请保持 `config.json` 为 `0600`；程序会在 Unix 上对更宽松的权限
+给出警告。日志和 URL 校验错误不会输出 userinfo、query 或 fragment。
 
 ### Reasoning 透传（可选）
 
@@ -213,8 +222,10 @@ go vet ./...
 
 ## 自更新(OTA)
 
-CI 在 push master 时发布滚动 `dev` prerelease,push `v*` tag 时发布正式 release;
-所有资产附带 `.sha256` 与 Ed25519 签名 `.sha256.sig`,客户端强制验签。
+CI 在 push master 时发布滚动 `dev` prerelease，push 严格的 `vX.Y.Z` tag 时发布
+正式 release。`version.json` 是带版本号、tag 和各平台 SHA256 的签名 manifest；
+每个二进制还附带精确文件名的 `.sha256` 与 Ed25519 签名 `.sha256.sig`。客户端要求
+manifest、checksum 与实际二进制三方一致，并拒绝未签名或旧版 manifest。
 
 ```bash
 responses2chat version           # 查看当前版本
@@ -226,4 +237,9 @@ responses2chat update -channel dev   # 跟进 dev 滚动预发布
 更新配置读取 `config.json` 的 `update` 段：`channel`(stable|dev)、
 `source`(github|proxy)、`proxy_base_url`、`repo`(默认 `lieyanc/responses2chat`)。
 命令行 `-channel`/`-source`/`-proxy-url`/`-repo` 优先于配置文件；没有
-`config.json` 时按内置默认值运行。
+`config.json` 时按内置默认值运行。无法识别的 channel/source、非法仓库名或代理
+URL 会直接报错，不会静默切换更新来源。
+
+发布维护者注意：启用 `manifest_version: 1` 的客户端后，`dev` 和 `stable` 各自都必须
+至少发布一次包含新 manifest 的桥接 release；旧 release 会被有意拒绝。发布私钥只存于
+GitHub Actions 的 `UPDATE_SIGNING_KEY` secret，不能写入仓库。

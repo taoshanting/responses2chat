@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,12 +17,13 @@ import (
 )
 
 const (
-	defaultMaxBodySize            = int64(32 << 20)
-	defaultMaxUpstreamBodySize    = int64(64 << 20)
-	defaultMaxConcurrentRequests  = 128
-	defaultDownstreamWriteTimeout = 30 * time.Second
-	maxUpstreamErrorBodySize      = int64(1 << 20)
-	maxLogFieldBytes              = 512
+	defaultMaxBodySize             = int64(32 << 20)
+	defaultMaxUpstreamBodySize     = int64(32 << 20)
+	defaultMaxConcurrentRequests   = 16
+	defaultDownstreamWriteTimeout  = 30 * time.Second
+	defaultBufferedUpstreamTimeout = 10 * time.Minute
+	maxUpstreamErrorBodySize       = int64(1 << 20)
+	maxLogFieldBytes               = 512
 )
 
 var errBodyTooLarge = errors.New("body exceeds configured size limit")
@@ -61,8 +63,8 @@ type Handler struct {
 
 func New(config Config) (*Handler, error) {
 	parsed, err := url.Parse(config.UpstreamURL)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.Fragment != "" {
-		return nil, fmt.Errorf("invalid upstream URL %q", config.UpstreamURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.Fragment != "" || parsed.ForceQuery {
+		return nil, fmt.Errorf("invalid upstream URL")
 	}
 	if config.MaxBodySize <= 0 {
 		config.MaxBodySize = defaultMaxBodySize
@@ -82,10 +84,14 @@ func New(config Config) (*Handler, error) {
 	if config.Logger == nil {
 		config.Logger = log.Default()
 	}
+	client := *config.HTTPClient
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	return &Handler{
 		upstreamURL:            parsed.String(),
 		maxBodySize:            config.MaxBodySize,
-		client:                 config.HTTPClient,
+		client:                 &client,
 		logger:                 config.Logger,
 		reasoningPassthrough:   config.ReasoningPassthrough,
 		retryUnsupportedParams: config.RetryUnsupportedParams,
@@ -100,7 +106,8 @@ func ChatCompletionsURL(base string) string {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+	path := r.URL.EscapedPath()
+	if r.Method == http.MethodGet && path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
 		return
@@ -120,9 +127,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 
 	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
+	case r.Method == http.MethodPost && path == "/v1/responses":
 		h.createResponse(recorder, r)
-	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+	case r.Method == http.MethodPost && path == "/v1/chat/completions":
 		h.proxyChatCompletions(recorder, r)
 	default:
 		writeAPIError(recorder, http.StatusNotFound, "route not found", "invalid_request_error", nil)
@@ -220,14 +227,24 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.logger.Printf("responses: model=%s stream=%t", logField(stringValue(chatRequest["model"])), meta.stream)
-	upstreamBody, err := json.Marshal(chatRequest)
+	upstreamBody, err := encodeJSONLimited(chatRequest, h.maxBodySize)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			writeAPIError(w, http.StatusRequestEntityTooLarge, "converted request body is too large", "invalid_request_error", nil)
+			return
+		}
 		writeAPIError(w, http.StatusInternalServerError, "failed to encode upstream request", "server_error", nil)
 		return
 	}
 
+	upstreamContext := r.Context()
+	if !meta.stream {
+		var cancel context.CancelFunc
+		upstreamContext, cancel = context.WithTimeout(upstreamContext, defaultBufferedUpstreamTimeout)
+		defer cancel()
+	}
 	sendUpstream := func(payload []byte) (*http.Response, error) {
-		upstreamRequest, err := http.NewRequestWithContext(r.Context(), http.MethodPost, h.upstreamURL, bytes.NewReader(payload))
+		upstreamRequest, err := http.NewRequestWithContext(upstreamContext, http.MethodPost, h.upstreamURL, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
@@ -258,6 +275,7 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 		removed := stripUnsupportedParams(chatRequest, errorBody)
 		if readErr != nil || len(removed) == 0 {
 			copyEndToEndHeaders(w.Header(), upstreamResponse.Header)
+			stripRewrittenResponseHeaders(w.Header())
 			if errors.Is(readErr, errBodyTooLarge) {
 				writeAPIError(w, http.StatusBadGateway, "upstream error response is too large", "upstream_error", "response_too_large")
 				return
@@ -266,7 +284,7 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.logger.Printf("upstream rejected unsupported parameter(s) %s; retrying without them", strings.Join(removed, ", "))
-		upstreamBody, err = json.Marshal(chatRequest)
+		upstreamBody, err = encodeJSONLimited(chatRequest, h.maxBodySize)
 		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, "failed to encode upstream request", "server_error", nil)
 			return
@@ -283,12 +301,17 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 	}
 	defer upstreamResponse.Body.Close()
 	copyEndToEndHeaders(w.Header(), upstreamResponse.Header)
+	stripRewrittenResponseHeaders(w.Header())
+	if upstreamResponse.StatusCode >= 300 && upstreamResponse.StatusCode < 400 {
+		w.Header().Del("Location")
+		writeAPIError(w, http.StatusBadGateway, "upstream redirects are not allowed", "upstream_error", "redirect_not_allowed")
+		return
+	}
 
 	if upstreamResponse.StatusCode < 200 || upstreamResponse.StatusCode >= 300 {
 		h.proxyError(w, upstreamResponse)
 		return
 	}
-	stripRewrittenResponseHeaders(w.Header())
 	if meta.stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -316,7 +339,9 @@ func (h *Handler) createResponse(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(upstreamResponse.StatusCode)
-	_ = json.NewEncoder(w).Encode(response)
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	_ = encoder.Encode(response)
 }
 
 // proxyChatCompletions forwards native Chat Completions requests to the
@@ -341,6 +366,9 @@ func (h *Handler) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyEndToEndHeaders(upstreamRequest.Header, r.Header)
+	if upstreamRequest.Header.Get("Accept-Encoding") == "" {
+		upstreamRequest.Header.Set("Accept-Encoding", "identity")
+	}
 
 	upstreamResponse, err := h.client.Do(upstreamRequest)
 	if err != nil {
@@ -353,6 +381,12 @@ func (h *Handler) proxyChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer upstreamResponse.Body.Close()
 	copyEndToEndHeaders(w.Header(), upstreamResponse.Header)
+	if upstreamResponse.StatusCode >= 300 && upstreamResponse.StatusCode < 400 {
+		w.Header().Del("Location")
+		stripRewrittenResponseHeaders(w.Header())
+		writeAPIError(w, http.StatusBadGateway, "upstream redirects are not allowed", "upstream_error", "redirect_not_allowed")
+		return
+	}
 	w.WriteHeader(upstreamResponse.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
@@ -478,6 +512,28 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	return data, nil
 }
 
+type limitedBuffer struct {
+	bytes.Buffer
+	limit int64
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if int64(len(p)) > b.limit-int64(b.Len()) {
+		return 0, errBodyTooLarge
+	}
+	return b.Buffer.Write(p)
+}
+
+func encodeJSONLimited(value any, limit int64) ([]byte, error) {
+	buffer := &limitedBuffer{limit: limit}
+	encoder := json.NewEncoder(buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
 func minInt64(a, b int64) int64 {
 	if a < b {
 		return a
@@ -495,7 +551,9 @@ func logField(value string) string {
 func writeAPIError(w http.ResponseWriter, status int, message, errorType string, code any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	_ = encoder.Encode(map[string]any{
 		"error": map[string]any{
 			"message": message,
 			"type":    errorType,
@@ -543,7 +601,18 @@ func copyEndToEndHeaders(dst, src http.Header) {
 }
 
 func stripRewrittenRequestHeaders(header http.Header) {
-	for _, name := range []string{"Accept-Encoding", "Content-Encoding", "Content-Md5", "Digest"} {
+	for _, name := range []string{
+		"Accept-Encoding",
+		"Content-Encoding",
+		"Content-Md5",
+		"Digest",
+		"If-Match",
+		"If-Modified-Since",
+		"If-None-Match",
+		"If-Range",
+		"If-Unmodified-Since",
+		"Range",
+	} {
 		header.Del(name)
 	}
 }

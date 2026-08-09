@@ -13,7 +13,11 @@ import (
 // dev-channel builds are applied immediately instead of parking in "ready".
 // On Unix a successful apply never returns: the process image is replaced.
 func (u *Updater) RunOnce(ctx context.Context) error {
-	cfg := normalizeConfig(u.cfg())
+	rawCfg := u.cfg()
+	if err := ValidateConfig(rawCfg); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	cfg := normalizeConfig(rawCfg)
 
 	u.logger.Printf("update: current version %s (%s), channel=%s, source=%s", version.Version, version.Commit, cfg.Channel, cfg.Source)
 

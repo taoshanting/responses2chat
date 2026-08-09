@@ -3,11 +3,13 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,6 +19,7 @@ func TestNewRejectsUnsafeUpstreamURLs(t *testing.T) {
 		"ftp://up.example/v1/chat/completions",
 		"https://user:secret@up.example/v1/chat/completions",
 		"https://up.example/v1/chat/completions#fragment",
+		"https://up.example/v1/chat/completions?",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			if _, err := New(Config{UpstreamURL: raw}); err == nil {
@@ -26,6 +29,72 @@ func TestNewRejectsUnsafeUpstreamURLs(t *testing.T) {
 	}
 	if _, err := New(Config{UpstreamURL: "https://up.example/v1/chat/completions?api-version=2026-01-01"}); err != nil {
 		t.Fatalf("full upstream URL query was rejected: %v", err)
+	}
+}
+
+func TestHandlerDoesNotFollowUpstreamRedirects(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		if key := r.Header.Get("X-Api-Key"); key != "" {
+			t.Errorf("redirect target received API key %q", key)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/metadata", http.StatusTemporaryRedirect)
+	}))
+	defer upstream.Close()
+	handler, err := New(Config{UpstreamURL: upstream.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	request.Header.Set("X-Api-Key", "secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "redirect_not_allowed") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Location") != "" {
+		t.Fatalf("upstream redirect location leaked: %q", response.Header().Get("Location"))
+	}
+	if hits := targetHits.Load(); hits != 0 {
+		t.Fatalf("redirect target received %d requests", hits)
+	}
+}
+
+func TestHandlerRejectsEncodedRouteSeparators(t *testing.T) {
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	handler, err := New(Config{UpstreamURL: upstream.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1%2fresponses", strings.NewReader(`{"model":"m","input":"hi"}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound || hits.Load() != 0 {
+		t.Fatalf("status=%d upstream_hits=%d", response.Code, hits.Load())
+	}
+}
+
+func TestEncodeJSONLimitedDoesNotEscapeHTMLAndEnforcesLimit(t *testing.T) {
+	encoded, err := encodeJSONLimited(map[string]any{"value": "<>&"}, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), `\u003c`) || !strings.Contains(string(encoded), `"<>&"`) {
+		t.Fatalf("HTML characters were expanded: %s", encoded)
+	}
+	if _, err := encodeJSONLimited(map[string]any{"value": strings.Repeat("x", 64)}, 16); !errors.Is(err, errBodyTooLarge) {
+		t.Fatalf("encode error = %v, want body-too-large", err)
 	}
 }
 

@@ -251,6 +251,8 @@ func TestHandlerPreservesUpstreamJSONError(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-Request-Id", "req_upstream")
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Digest", "sha-256=stale")
+		w.Header().Set("Etag", `"stale"`)
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"message":"rate limited","type":"rate_limit_error","param":null,"code":"rate_limit"}}`)
 	}))
@@ -264,6 +266,9 @@ func TestHandlerPreservesUpstreamJSONError(t *testing.T) {
 	}
 	if recorder.Header().Get("X-Request-Id") != "req_upstream" || !strings.Contains(recorder.Body.String(), `"code":"rate_limit"`) {
 		t.Fatalf("headers/body were not preserved: %#v %s", recorder.Header(), recorder.Body.String())
+	}
+	if recorder.Header().Get("Digest") != "" || recorder.Header().Get("Etag") != "" {
+		t.Fatalf("stale error representation headers remain: %#v", recorder.Header())
 	}
 }
 
@@ -289,12 +294,13 @@ func assertMonotonicSequences(t *testing.T, stream string) {
 func TestHandlerProxiesChatCompletionsVerbatim(t *testing.T) {
 	requestBody := `{"model":"m","messages":[{"role":"user","content":"hi"}],"some_future_field":{"nested":true}}`
 	responseBody := `{"id":"chatcmpl-raw","object":"chat.completion","vendor_extension":123,"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`
-	var upstreamAuth, upstreamGot string
+	var upstreamAuth, upstreamEncoding, upstreamGot string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Errorf("upstream path = %s", r.URL.Path)
 		}
 		upstreamAuth = r.Header.Get("Authorization")
+		upstreamEncoding = r.Header.Get("Accept-Encoding")
 		body, _ := io.ReadAll(r.Body)
 		upstreamGot = string(body)
 		w.Header().Set("Content-Type", "application/json")
@@ -315,6 +321,9 @@ func TestHandlerProxiesChatCompletionsVerbatim(t *testing.T) {
 	}
 	if upstreamAuth != "Bearer chat-key" {
 		t.Fatalf("authorization was not passed through: %q", upstreamAuth)
+	}
+	if upstreamEncoding != "identity" {
+		t.Fatalf("missing Accept-Encoding was forwarded as %q, want identity", upstreamEncoding)
 	}
 	if recorder.Body.String() != responseBody {
 		t.Fatalf("response body was not passed through verbatim: %s", recorder.Body.String())
@@ -377,10 +386,12 @@ func TestRewrittenPayloadHeadersAreRemoved(t *testing.T) {
 		"Content-Encoding": []string{"gzip"},
 		"Content-Md5":      []string{"stale"},
 		"Digest":           []string{"sha-256=stale"},
+		"If-None-Match":    []string{`"old"`},
+		"Range":            []string{"bytes=0-10"},
 		"X-Custom":         []string{"keep"},
 	}
 	stripRewrittenRequestHeaders(requestHeaders)
-	if requestHeaders.Get("Accept-Encoding") != "" || requestHeaders.Get("Content-Encoding") != "" || requestHeaders.Get("Content-Md5") != "" || requestHeaders.Get("Digest") != "" {
+	if requestHeaders.Get("Accept-Encoding") != "" || requestHeaders.Get("Content-Encoding") != "" || requestHeaders.Get("Content-Md5") != "" || requestHeaders.Get("Digest") != "" || requestHeaders.Get("If-None-Match") != "" || requestHeaders.Get("Range") != "" {
 		t.Fatalf("stale request representation headers remain: %#v", requestHeaders)
 	}
 	if requestHeaders.Get("X-Custom") != "keep" {
