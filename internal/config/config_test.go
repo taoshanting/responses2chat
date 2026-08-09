@@ -182,6 +182,21 @@ func TestLoadInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsOversizedAndNonRegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	largePath := filepath.Join(dir, "large.json")
+	if err := os.WriteFile(largePath, make([]byte, maxConfigSize+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(largePath); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("oversized Load error = %v, want size limit", err)
+	}
+
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("directory Load error = %v, want regular-file rejection", err)
+	}
+}
+
 func TestMigrateAddsMissingSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	body := `{

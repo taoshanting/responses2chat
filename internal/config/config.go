@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -27,6 +28,8 @@ var Template []byte
 // DefaultPath is where config.json is looked up when -config is not given,
 // relative to the working directory.
 const DefaultPath = "config.json"
+
+const maxConfigSize = 1 << 20
 
 // Update carries the settings consumed by `responses2chat update`. Empty
 // fields fall back to the updater's built-in defaults.
@@ -63,7 +66,7 @@ func (c Config) RetryUnsupportedParamsEnabled() bool {
 // Load parses the file at path and applies defaults. Serving traffic
 // additionally requires ValidateServer; `update` runs without an upstream.
 func Load(path string) (Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if err != nil {
 		return Config{}, err
 	}
@@ -153,7 +156,16 @@ func WriteTemplate(path string) error {
 		_ = os.Remove(path)
 		return err
 	}
-	return f.Close()
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 // Migrate appends settings that exist in the bundled template but are
@@ -169,7 +181,7 @@ func Migrate(path string) ([]string, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("migrate %s: config must be a regular file", path)
 	}
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +198,32 @@ func Migrate(path string) ([]string, error) {
 		return nil, err
 	}
 	return added, nil
+}
+
+func readConfigFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("config %s must be a regular file", path)
+	}
+	if info.Size() > maxConfigSize {
+		return nil, fmt.Errorf("config %s exceeds %d-byte limit", path, maxConfigSize)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxConfigSize {
+		return nil, fmt.Errorf("config %s exceeds %d-byte limit", path, maxConfigSize)
+	}
+	return data, nil
 }
 
 func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
