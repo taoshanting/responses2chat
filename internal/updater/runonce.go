@@ -3,6 +3,7 @@ package updater
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/lieyan/responses2chat/internal/version"
 )
@@ -20,11 +21,8 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("check failed: %w", err)
 	}
-	if release == nil {
-		u.logger.Printf("update: no release found for channel %s", cfg.Channel)
-		return nil
-	}
-	if !hasUpdate {
+	// A nil release ("no release found") is already logged by the fetcher.
+	if release == nil || !hasUpdate {
 		return nil
 	}
 
@@ -33,6 +31,9 @@ func (u *Updater) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
+	// Successful exec/exit never returns; any returned failure should not leave
+	// a verified-but-unapplied binary accumulating in the cache.
+	defer func() { _ = os.Remove(binaryPath) }()
 
 	if err := u.waitForIdle(ctx); err != nil {
 		return fmt.Errorf("apply canceled while waiting for idle: %w", err)

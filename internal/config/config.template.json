@@ -9,6 +9,6 @@
     "channel": "stable",
     "source": "github",
     "proxy_base_url": "",
-    "repo": ""
+    "repo": "lieyanc/responses2chat"
   }
 }

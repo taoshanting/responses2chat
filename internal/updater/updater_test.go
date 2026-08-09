@@ -14,7 +14,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,15 +28,24 @@ func TestCheckOnlySelectsNewestStableRelease(t *testing.T) {
 	originalVersion := version.Version
 	defer func() { version.Version = originalVersion }()
 	version.Version = "v1.0.0"
+	targetName := testUpdater(Config{}).targetName()
+	sign := setTestSigningKey(t)
+	metadata, metadataSig := makeTestManifest(t, sign, "v1.4.0", "bbbbbbb", "v1.4.0", targetName, strings.Repeat("a", 64))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/releases/owner/repo/latest" {
+		switch r.URL.Path {
+		case "/api/releases/owner/repo/latest":
+			_ = json.NewEncoder(w).Encode(releaseInfo{
+				TagName: "v1.4.0",
+				Assets:  testMetadataAssets("v1.4.0"),
+			})
+		case "/download/owner/repo/v1.4.0/version.json":
+			_, _ = w.Write(metadata)
+		case "/download/owner/repo/v1.4.0/version.json.sig":
+			_, _ = w.Write(metadataSig)
+		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(releaseInfo{
-			TagName: "v1.4.0",
-			Assets:  []assetInfo{},
-		})
 	}))
 	defer server.Close()
 
@@ -64,6 +76,9 @@ func TestCheckOnlySelectsNewestPrerelease(t *testing.T) {
 	version.Version = "dev-0007-20260401-aaaaaaa"
 	version.Commit = "aaaaaaa"
 	remoteVersion := "dev-0042-20260425-bbbbbbb"
+	targetName := testUpdater(Config{}).targetName()
+	sign := setTestSigningKey(t)
+	metadata, metadataSig := makeTestManifest(t, sign, remoteVersion, "bbbbbbb", "dev", targetName, strings.Repeat("a", 64))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -72,20 +87,12 @@ func TestCheckOnlySelectsNewestPrerelease(t *testing.T) {
 				TagName:         "dev",
 				TargetCommitish: "bbbbbbb",
 				Prerelease:      true,
-				Assets: []assetInfo{
-					{
-						Name:               "version.json",
-						BrowserDownloadURL: "https://github.com/owner/repo/releases/download/dev/version.json",
-					},
-				},
+				Assets:          testMetadataAssets("dev"),
 			})
 		case "/download/owner/repo/dev/version.json":
-			_ = json.NewEncoder(w).Encode(releaseVersionInfo{
-				Version:   remoteVersion,
-				Commit:    "bbbbbbb",
-				BuildTime: "2026-04-25T00:00:00Z",
-				Tag:       "dev",
-			})
+			_, _ = w.Write(metadata)
+		case "/download/owner/repo/dev/version.json.sig":
+			_, _ = w.Write(metadataSig)
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
@@ -118,6 +125,9 @@ func TestCheckOnlySkipsDevReleaseForSameCommit(t *testing.T) {
 	defer func() { version.Commit = originalCommit }()
 	version.Version = "dev-0042-20260425-bbbbbbb"
 	version.Commit = "bbbbbbb"
+	targetName := testUpdater(Config{}).targetName()
+	sign := setTestSigningKey(t)
+	metadata, metadataSig := makeTestManifest(t, sign, version.Version, version.Commit, "dev", targetName, strings.Repeat("a", 64))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -126,20 +136,12 @@ func TestCheckOnlySkipsDevReleaseForSameCommit(t *testing.T) {
 				TagName:         "dev",
 				TargetCommitish: "bbbbbbb",
 				Prerelease:      true,
-				Assets: []assetInfo{
-					{
-						Name:               "version.json",
-						BrowserDownloadURL: "https://github.com/owner/repo/releases/download/dev/version.json",
-					},
-				},
+				Assets:          testMetadataAssets("dev"),
 			})
 		case "/download/owner/repo/dev/version.json":
-			_ = json.NewEncoder(w).Encode(releaseVersionInfo{
-				Version:   "dev-0042-20260425-bbbbbbb",
-				Commit:    "bbbbbbb",
-				BuildTime: "2026-04-25T00:00:00Z",
-				Tag:       "dev",
-			})
+			_, _ = w.Write(metadata)
+		case "/download/owner/repo/dev/version.json.sig":
+			_, _ = w.Write(metadataSig)
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
@@ -193,6 +195,7 @@ func TestPerformUpdateDownloadsAndVerifiesPrerelease(t *testing.T) {
 	sum := fmt.Sprintf("%x", sha256.Sum256(binary))
 	shaContent := sum + "  " + targetName + "\n"
 	sign := setTestSigningKey(t)
+	metadata, metadataSig := makeTestManifest(t, sign, remoteVersion, "bbbbbbb", tag, targetName, sum)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -219,6 +222,10 @@ func TestPerformUpdateDownloadsAndVerifiesPrerelease(t *testing.T) {
 						Name:               "version.json",
 						BrowserDownloadURL: "https://github.com/owner/repo/releases/download/" + tag + "/version.json",
 					},
+					{
+						Name:               "version.json.sig",
+						BrowserDownloadURL: "https://github.com/owner/repo/releases/download/" + tag + "/version.json.sig",
+					},
 				},
 			})
 		case "/download/owner/repo/" + tag + "/" + targetName:
@@ -228,12 +235,9 @@ func TestPerformUpdateDownloadsAndVerifiesPrerelease(t *testing.T) {
 		case "/download/owner/repo/" + tag + "/" + targetName + ".sha256.sig":
 			_, _ = w.Write([]byte(sign([]byte(shaContent))))
 		case "/download/owner/repo/" + tag + "/version.json":
-			_ = json.NewEncoder(w).Encode(releaseVersionInfo{
-				Version:   remoteVersion,
-				Commit:    "bbbbbbb",
-				BuildTime: "2026-04-25T00:00:00Z",
-				Tag:       tag,
-			})
+			_, _ = w.Write(metadata)
+		case "/download/owner/repo/" + tag + "/version.json.sig":
+			_, _ = w.Write(metadataSig)
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
@@ -272,7 +276,11 @@ func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
 		return context.Canceled
 	}
 	u.status.State = "ready"
-	u.pendingBinaryPath = t.TempDir() + "/responses2chat-new"
+	u.pendingBinaryPath = filepath.Join(t.TempDir(), "responses2chat-new")
+	if err := os.WriteFile(u.pendingBinaryPath, []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pendingPath := u.pendingBinaryPath
 	u.pendingTag = "v1.2.0"
 
 	if err := u.ApplyPending(context.Background()); err != nil {
@@ -296,6 +304,9 @@ func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
 	}
 
 	time.Sleep(250 * time.Millisecond)
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("failed apply left pending binary behind: %v", err)
+	}
 }
 
 func TestPerformUpdateRejectsReleaseWithoutSHA256(t *testing.T) {
@@ -318,20 +329,26 @@ func TestPerformUpdateRejectsReleaseWithoutSHA256(t *testing.T) {
 
 	targetName := u.targetName()
 	binary := []byte("new binary")
+	sum := fmt.Sprintf("%x", sha256.Sum256(binary))
+	sign := setTestSigningKey(t)
+	metadata, metadataSig := makeTestManifest(t, sign, "v1.4.0", "bbbbbbb", "v1.4.0", targetName, sum)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/releases/owner/repo/latest":
+			assets := append([]assetInfo{{
+				Name:               targetName,
+				BrowserDownloadURL: "https://github.com/owner/repo/releases/download/v1.4.0/" + targetName,
+				Size:               int64(len(binary)),
+			}}, testMetadataAssets("v1.4.0")...)
 			_ = json.NewEncoder(w).Encode(releaseInfo{
 				TagName: "v1.4.0",
-				Assets: []assetInfo{
-					{
-						Name:               targetName,
-						BrowserDownloadURL: "https://github.com/owner/repo/releases/download/v1.4.0/" + targetName,
-						Size:               int64(len(binary)),
-					},
-				},
+				Assets:  assets,
 			})
+		case "/download/owner/repo/v1.4.0/version.json":
+			_, _ = w.Write(metadata)
+		case "/download/owner/repo/v1.4.0/version.json.sig":
+			_, _ = w.Write(metadataSig)
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
@@ -361,10 +378,12 @@ func TestCheckOnlyGitHubDirectDevChannel(t *testing.T) {
 
 	sign := setTestSigningKey(t)
 	metadata, err := json.Marshal(releaseVersionInfo{
-		Version:   remoteVersion,
-		Commit:    "bbbbbbb",
-		BuildTime: "2026-04-25T00:00:00Z",
-		Tag:       "dev",
+		ManifestVersion: manifestVersion,
+		Version:         remoteVersion,
+		Commit:          "bbbbbbb",
+		BuildTime:       "2026-04-25T00:00:00Z",
+		Tag:             "dev",
+		Assets:          map[string]string{testUpdater(Config{}).targetName(): strings.Repeat("a", 64)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -403,10 +422,12 @@ func TestCheckOnlyGitHubDirectStableChannel(t *testing.T) {
 
 	sign := setTestSigningKey(t)
 	metadata, err := json.Marshal(releaseVersionInfo{
-		Version:   "v1.4.0",
-		Commit:    "bbbbbbb",
-		BuildTime: "2026-04-25T00:00:00Z",
-		Tag:       "v1.4.0",
+		ManifestVersion: manifestVersion,
+		Version:         "v1.4.0",
+		Commit:          "bbbbbbb",
+		BuildTime:       "2026-04-25T00:00:00Z",
+		Tag:             "v1.4.0",
+		Assets:          map[string]string{testUpdater(Config{}).targetName(): strings.Repeat("a", 64)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -483,6 +504,336 @@ func TestWaitForIdleStopsWhenApplicationContextIsCanceled(t *testing.T) {
 	}
 }
 
+func TestDownloadRejectsSignedAssetMixAndMatch(t *testing.T) {
+	sign := setTestSigningKey(t)
+	for _, tc := range []struct {
+		name           string
+		checksumName   func(string) string
+		manifestDigest string
+		wantError      string
+	}{
+		{
+			name:           "checksum names another platform",
+			checksumName:   func(target string) string { return target + "-other-platform" },
+			manifestDigest: "actual",
+			wantError:      "expected",
+		},
+		{
+			name:           "old signed binary disagrees with manifest",
+			checksumName:   func(target string) string { return target },
+			manifestDigest: strings.Repeat("0", 64),
+			wantError:      "signed manifest",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			u := New(
+				func() Config { return Config{Channel: "dev", Source: SourceGitHub, Repo: "owner/repo"} },
+				func() string { return dataDir },
+				log.New(io.Discard, "", 0),
+				RestartHooks{},
+			)
+			targetName := u.targetName()
+			binary := []byte("previous signed binary")
+			digest := fmt.Sprintf("%x", sha256.Sum256(binary))
+			manifestDigest := tc.manifestDigest
+			if manifestDigest == "actual" {
+				manifestDigest = digest
+			}
+			checksum := digest + "  " + tc.checksumName(targetName) + "\n"
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/binary":
+					_, _ = w.Write(binary)
+				case "/checksum":
+					_, _ = w.Write([]byte(checksum))
+				case "/signature":
+					_, _ = w.Write([]byte(sign([]byte(checksum))))
+				default:
+					t.Fatalf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			release := &releaseInfo{
+				TagName:        "dev",
+				ManifestSHA256: manifestDigest,
+				Assets: []assetInfo{
+					{Name: targetName, BrowserDownloadURL: server.URL + "/binary", Size: int64(len(binary))},
+					{Name: targetName + ".sha256", BrowserDownloadURL: server.URL + "/checksum"},
+					{Name: targetName + ".sha256.sig", BrowserDownloadURL: server.URL + "/signature"},
+				},
+			}
+			if _, err := u.download(context.Background(), normalizeConfig(u.cfg()), release); err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("download error = %v, want %q", err, tc.wantError)
+			}
+			tmpPath := filepath.Join(dataDir, "updates", "responses2chat-dev.tmp")
+			if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+				t.Fatalf("temporary download was not removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestProxyRejectsReplayedSignedManifestUnderNewTag(t *testing.T) {
+	originalVersion := version.Version
+	defer func() { version.Version = originalVersion }()
+	version.Version = "v2.0.0"
+	targetName := testUpdater(Config{}).targetName()
+	sign := setTestSigningKey(t)
+	metadata, metadataSig := makeTestManifest(t, sign, "v1.0.0", "aaaaaaa", "v1.0.0", targetName, strings.Repeat("a", 64))
+	assets := []assetInfo{
+		{Name: "version.json", BrowserDownloadURL: "https://github.com/owner/repo/releases/download/v999.0.0/version.json"},
+		{Name: "version.json.sig", BrowserDownloadURL: "https://github.com/owner/repo/releases/download/v999.0.0/version.json.sig"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/releases/owner/repo/latest":
+			_ = json.NewEncoder(w).Encode(releaseInfo{TagName: "v999.0.0", Assets: assets})
+		case "/download/owner/repo/v999.0.0/version.json":
+			_, _ = w.Write(metadata)
+		case "/download/owner/repo/v999.0.0/version.json.sig":
+			_, _ = w.Write(metadataSig)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	u := testUpdater(Config{Channel: "stable", Source: SourceProxy, ProxyBaseURL: server.URL, Repo: "owner/repo"})
+	if _, err := u.CheckOnly(context.Background()); err == nil || !strings.Contains(err.Error(), "does not match discovered tag") {
+		t.Fatalf("CheckOnly error = %v, want signed tag mismatch", err)
+	}
+}
+
+func TestResolveDownloadURLRejectsUntrustedAssets(t *testing.T) {
+	u := testUpdater(Config{})
+	cfg := normalizeConfig(Config{Source: SourceProxy, ProxyBaseURL: "https://mirror.example/base", Repo: "owner/repo"})
+	for _, assetURL := range []string{
+		"http://127.0.0.1/admin",
+		"https://example.com/owner/repo/releases/download/dev/version.json",
+		"https://github.com/other/repo/releases/download/dev/version.json",
+		"https://github.com/owner/repo/releases/download/other/version.json",
+	} {
+		asset := &assetInfo{Name: "version.json", BrowserDownloadURL: assetURL}
+		if _, err := u.resolveDownloadURL(cfg, "dev", asset); err == nil {
+			t.Fatalf("expected URL %q to be rejected", assetURL)
+		}
+	}
+	asset := &assetInfo{Name: "version.json", BrowserDownloadURL: "https://github.com/owner/repo/releases/download/dev/version.json"}
+	got, err := u.resolveDownloadURL(cfg, "dev", asset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://mirror.example/base/download/owner/repo/dev/version.json" {
+		t.Fatalf("resolved URL = %q", got)
+	}
+}
+
+func TestProxyAssetRedirectCannotBypassURLValidation(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		_, _ = io.WriteString(w, "sensitive local response")
+	}))
+	defer target.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/admin", http.StatusFound)
+	}))
+	defer mirror.Close()
+
+	cfg := normalizeConfig(Config{Source: SourceProxy, ProxyBaseURL: mirror.URL, Repo: "owner/repo"})
+	asset := &assetInfo{
+		Name:               "version.json",
+		BrowserDownloadURL: "https://github.com/owner/repo/releases/download/dev/version.json",
+	}
+	u := testUpdater(cfg)
+	if _, err := u.fetchAsset(context.Background(), cfg, "dev", asset, maxManifestSize); err == nil || !strings.Contains(err.Error(), "status 302") {
+		t.Fatalf("fetchAsset error = %v, want redirect rejection", err)
+	}
+	if hits := targetHits.Load(); hits != 0 {
+		t.Fatalf("redirect target received %d requests", hits)
+	}
+}
+
+func TestGitHubRedirectPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		url  string
+		want bool
+	}{
+		{"https://github.com/owner/repo/releases/download/dev/file", true},
+		{"https://release-assets.githubusercontent.com/file?token=x", true},
+		{"https://objects.githubusercontent.com/file", true},
+		{"http://github.com/file", false},
+		{"https://github.com.evil.example/file", false},
+		{"https://127.0.0.1/admin", false},
+		{"https://github.com:444/file", false},
+	} {
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := isTrustedGitHubRedirect(req.URL); got != tc.want {
+			t.Fatalf("isTrustedGitHubRedirect(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestProxyReleaseBodyLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", maxReleaseSize+1))
+	}))
+	defer server.Close()
+	u := testUpdater(Config{Source: SourceProxy, ProxyBaseURL: server.URL, Repo: "owner/repo"})
+	if _, err := u.CheckOnly(context.Background()); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("CheckOnly error = %v, want body limit", err)
+	}
+}
+
+func TestDownloadFileEnforcesKnownAndChunkedLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{
+			name: "known content length",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "5")
+				_, _ = io.WriteString(w, "12345")
+			},
+		},
+		{
+			name: "chunked body",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "123")
+				w.(http.Flusher).Flush()
+				_, _ = io.WriteString(w, "45")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(tc.handler)
+			defer server.Close()
+			dest := filepath.Join(t.TempDir(), "update.tmp")
+			u := testUpdater(Config{})
+			if err := u.downloadFileWithLimit(context.Background(), server.URL, dest, 0, 4); err == nil || !strings.Contains(err.Error(), "limit") {
+				t.Fatalf("download error = %v, want limit", err)
+			}
+			if _, err := os.Stat(dest); !os.IsNotExist(err) {
+				t.Fatalf("partial download was not removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestDownloadFileRefusesExistingOrLinkedDestination(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linked := target + ".tmp"
+	if err := os.Symlink(target, linked); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	u := testUpdater(Config{})
+	if err := u.downloadFileWithLimit(context.Background(), "http://127.0.0.1/unused", linked, 0, 4); err == nil {
+		t.Fatal("expected an existing symlink destination to be rejected")
+	}
+	contents, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "keep" {
+		t.Fatalf("symlink target was modified: %q", contents)
+	}
+}
+
+func TestDevVersionComparisonIsMonotonic(t *testing.T) {
+	originalVersion := version.Version
+	defer func() { version.Version = originalVersion }()
+	version.Version = "dev-0042-20260425-bbbbbbb"
+	u := testUpdater(Config{})
+	for _, tc := range []struct {
+		remote string
+		want   bool
+	}{
+		{"dev-0041-20260424-aaaaaaa", false},
+		{"dev-0042-20260425-bbbbbbb", false},
+		{"dev-0042-20260425-ccccccc", false},
+		{"dev-0043-20260426-ccccccc", true},
+	} {
+		if got := u.isNewer(releaseInfo{TagName: "dev", Version: tc.remote}, "dev"); got != tc.want {
+			t.Fatalf("isNewer(%q) = %v, want %v", tc.remote, got, tc.want)
+		}
+	}
+}
+
+func TestVersionComparisonAllowsExplicitChannelSwitch(t *testing.T) {
+	originalVersion := version.Version
+	defer func() { version.Version = originalVersion }()
+	u := testUpdater(Config{})
+
+	version.Version = "v1.2.3"
+	if !u.isNewer(releaseInfo{TagName: "dev", Version: "dev-0042-20260425-bbbbbbb"}, "dev") {
+		t.Fatal("stable build could not switch to the dev channel")
+	}
+
+	version.Version = "dev-0042-20260425-bbbbbbb"
+	if !u.isNewer(releaseInfo{TagName: "v1.2.3", Version: "v1.2.3"}, "stable") {
+		t.Fatal("dev build could not switch to the stable channel")
+	}
+}
+
+func TestStableVersionComparisonIsStrict(t *testing.T) {
+	for _, invalid := range []string{"1.2.3", "v1.2", "v1.2.3-rc.1", "v01.2.3", "v1.2.3.4", "version"} {
+		if isStableVersion(invalid) || semverGreater(invalid, "v1.0.0") {
+			t.Fatalf("invalid stable version %q was accepted", invalid)
+		}
+	}
+	if !semverGreater("v1.2.4", "v1.2.3") || semverGreater("v1.2.3", "v1.2.3") {
+		t.Fatal("valid stable version ordering failed")
+	}
+}
+
+func TestReleaseManifestIsRequired(t *testing.T) {
+	targetName := testUpdater(Config{}).targetName()
+	_, err := validateReleaseManifest(releaseVersionInfo{
+		Version: "v1.2.3",
+		Tag:     "v1.2.3",
+		Assets:  map[string]string{targetName: strings.Repeat("a", 64)},
+	}, "stable", "v1.2.3", targetName)
+	if err == nil || !strings.Contains(err.Error(), "manifest version") {
+		t.Fatalf("validateReleaseManifest error = %v, want missing manifest version", err)
+	}
+}
+
+func TestReleaseManifestRejectsNonCanonicalDevCommit(t *testing.T) {
+	targetName := testUpdater(Config{}).targetName()
+	_, err := validateReleaseManifest(releaseVersionInfo{
+		ManifestVersion: manifestVersion,
+		Version:         "dev-0042-20260425-bbbbbbb",
+		Commit:          "bbbbbbb-extra",
+		Tag:             "dev",
+		Assets:          map[string]string{targetName: strings.Repeat("a", 64)},
+	}, "dev", "dev", targetName)
+	if err == nil || !strings.Contains(err.Error(), "commit") {
+		t.Fatalf("validateReleaseManifest error = %v, want non-canonical commit rejection", err)
+	}
+}
+
+func TestNormalizeConfigInvalidChannelDefaultsToStable(t *testing.T) {
+	if got := normalizeConfig(Config{Channel: "stabel"}).Channel; got != "stable" {
+		t.Fatalf("invalid channel normalized to %q, want stable", got)
+	}
+	if got := normalizeConfig(Config{Channel: "DEV"}).Channel; got != "dev" {
+		t.Fatalf("dev channel normalized to %q", got)
+	}
+}
+
 func setTestSigningKey(t *testing.T) func(data []byte) string {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -511,4 +862,28 @@ func testUpdater(cfg Config) *Updater {
 		log.New(io.Discard, "", 0),
 		RestartHooks{},
 	)
+}
+
+func makeTestManifest(t *testing.T, sign func([]byte) string, releaseVersion, commit, tag, targetName, digest string) ([]byte, []byte) {
+	t.Helper()
+	metadata, err := json.Marshal(releaseVersionInfo{
+		ManifestVersion: manifestVersion,
+		Version:         releaseVersion,
+		Commit:          commit,
+		BuildTime:       "2026-04-25T00:00:00Z",
+		Tag:             tag,
+		Assets:          map[string]string{targetName: digest},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metadata, []byte(sign(metadata))
+}
+
+func testMetadataAssets(tag string) []assetInfo {
+	base := "https://github.com/owner/repo/releases/download/" + tag + "/"
+	return []assetInfo{
+		{Name: "version.json", BrowserDownloadURL: base + "version.json"},
+		{Name: "version.json.sig", BrowserDownloadURL: base + "version.json.sig"},
+	}
 }

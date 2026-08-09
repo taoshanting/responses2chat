@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 # All branch builds publish the same rolling `dev` tag/release. Cancel an older
 # branch run before a newer one can overwrite it; tag releases remain isolated
@@ -36,6 +36,10 @@ jobs:
           BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
+            if [[ ! "${VERSION}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "release tag must be a strict vX.Y.Z version: ${VERSION}" >&2
+              exit 1
+            fi
           elif [[ "${GITHUB_REF}" == refs/heads/master || "${GITHUB_REF}" == refs/heads/main ]]; then
             DATE="$(date -u +'%Y%m%d')"
             RUN_NUM="$(printf '%04d' "${GITHUB_RUN_NUMBER}")"
@@ -52,10 +56,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -102,10 +108,12 @@ jobs:
             ext: ""
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -114,16 +122,18 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          COMMIT: ${{ needs.meta.outputs.commit }}
+          BUILD_TIME: ${{ needs.meta.outputs.build_time }}
         run: |
           set -euo pipefail
           mkdir -p dist
 
-          VERSION="${{ needs.meta.outputs.version }}"
-          COMMIT="${{ needs.meta.outputs.commit }}"
-          BUILD_TIME="${{ needs.meta.outputs.build_time }}"
           PKG="github.com/lieyan/responses2chat/internal/version"
 
-          BIN="responses2chat-${{ matrix.target }}${{ matrix.ext }}"
+          BIN="responses2chat-${TARGET}${EXT}"
           go build -trimpath \
             -ldflags="-s -w -X ${PKG}.Version=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.BuildTime=${BUILD_TIME}" \
             -o "dist/${BIN}" ./cmd/responses2chat
@@ -133,7 +143,7 @@ jobs:
           )
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: responses2chat-${{ matrix.target }}
           path: dist/*
@@ -147,42 +157,33 @@ jobs:
       - meta
       - build
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
       - name: Build release metadata
         id: meta
+        env:
+          SHORT_SHA: ${{ needs.meta.outputs.commit }}
         run: |
           set -euo pipefail
-          SHORT_SHA="${{ needs.meta.outputs.commit }}"
           echo "title=Dev Build #${GITHUB_RUN_NUMBER} (${SHORT_SHA})" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: responses2chat-*
           path: release
           merge-multiple: true
-
-      - name: Add version metadata
-        run: |
-          set -euo pipefail
-          cat > release/version.json <<'EOF'
-          {
-            "version": "${{ needs.meta.outputs.version }}",
-            "commit": "${{ needs.meta.outputs.commit }}",
-            "build_time": "${{ needs.meta.outputs.build_time }}",
-            "tag": "dev"
-          }
-          EOF
 
       - name: Verify release asset set
         run: |
@@ -196,10 +197,34 @@ jobs:
             responses2chat-darwin-amd64
             responses2chat-darwin-arm64
           )
+          actual=(release/*)
+          if (( ${#actual[@]} != ${#expected[@]} * 2 )); then
+            echo "unexpected release asset count: got ${#actual[@]}, want $((${#expected[@]} * 2))" >&2
+            exit 1
+          fi
           for binary in "${expected[@]}"; do
             test -f "release/${binary}" || { echo "missing release/${binary}" >&2; exit 1; }
             test -f "release/${binary}.sha256" || { echo "missing release/${binary}.sha256" >&2; exit 1; }
           done
+          (
+            cd release
+            sha256sum --check --strict -- *.sha256
+          )
+
+      - name: Generate release manifest
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          COMMIT: ${{ needs.meta.outputs.commit }}
+          BUILD_TIME: ${{ needs.meta.outputs.build_time }}
+        run: |
+          set -euo pipefail
+          go run ./scripts/manifest \
+            -output release/version.json \
+            -version "${VERSION}" \
+            -commit "${COMMIT}" \
+            -build-time "${BUILD_TIME}" \
+            -tag dev \
+            release/*.sha256
 
       - name: Sign release assets
         env:
@@ -215,14 +240,17 @@ jobs:
       - name: Refresh dev tag and prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TITLE: ${{ steps.meta.outputs.title }}
         run: |
           set -euo pipefail
           gh release delete dev --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag || true
-          git tag -f dev "${GITHUB_SHA}"
-          git push --force origin refs/tags/dev
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/dev" || true
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref='refs/tags/dev' \
+            -f sha="${GITHUB_SHA}"
           gh release create dev release/* \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "${{ steps.meta.outputs.title }}" \
+            --title "${RELEASE_TITLE}" \
             --notes "Dev build for ${GITHUB_SHA}" \
             --prerelease \
             --target "${GITHUB_SHA}" \
@@ -235,33 +263,25 @@ jobs:
       - meta
       - build
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: responses2chat-*
           path: release
           merge-multiple: true
-
-      - name: Add version metadata
-        run: |
-          set -euo pipefail
-          cat > release/version.json <<'EOF'
-          {
-            "version": "${{ needs.meta.outputs.version }}",
-            "commit": "${{ needs.meta.outputs.commit }}",
-            "build_time": "${{ needs.meta.outputs.build_time }}",
-            "tag": "${{ github.ref_name }}"
-          }
-          EOF
 
       - name: Verify release asset set
         run: |
@@ -275,10 +295,35 @@ jobs:
             responses2chat-darwin-amd64
             responses2chat-darwin-arm64
           )
+          actual=(release/*)
+          if (( ${#actual[@]} != ${#expected[@]} * 2 )); then
+            echo "unexpected release asset count: got ${#actual[@]}, want $((${#expected[@]} * 2))" >&2
+            exit 1
+          fi
           for binary in "${expected[@]}"; do
             test -f "release/${binary}" || { echo "missing release/${binary}" >&2; exit 1; }
             test -f "release/${binary}.sha256" || { echo "missing release/${binary}.sha256" >&2; exit 1; }
           done
+          (
+            cd release
+            sha256sum --check --strict -- *.sha256
+          )
+
+      - name: Generate release manifest
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          COMMIT: ${{ needs.meta.outputs.commit }}
+          BUILD_TIME: ${{ needs.meta.outputs.build_time }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          go run ./scripts/manifest \
+            -output release/version.json \
+            -version "${VERSION}" \
+            -commit "${COMMIT}" \
+            -build-time "${BUILD_TIME}" \
+            -tag "${RELEASE_TAG}" \
+            release/*.sha256
 
       - name: Sign release assets
         env:
@@ -292,7 +337,7 @@ jobs:
           go run ./scripts/sign release/*.sha256 release/version.json
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
@@ -314,7 +359,7 @@ jobs:
       contents: read
     steps:
       - name: Delete artifacts from previous runs
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             const { owner, repo } = context.repo;
