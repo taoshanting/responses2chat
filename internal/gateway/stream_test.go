@@ -69,6 +69,31 @@ func TestConvertStreamAccumulatesToolNameAndWaitsForCallID(t *testing.T) {
 	}
 }
 
+func TestConvertStreamToleratesSerializerDefaultToolCallFields(t *testing.T) {
+	input := strings.Join([]string{
+		`data: {"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_real","function":{"name":"lookup","arguments":""}}]},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":null,"arguments":"{\"q\":"}}]},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":null,"function":{"name":null,"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	recorder := httptest.NewRecorder()
+	if err := convertStream(recorder, strings.NewReader(input), streamTestMeta(t), 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "event: response.failed") || !strings.Contains(body, `"call_id":"call_real"`) {
+		t.Fatalf("serializer-default tool call fields corrupted the stream:\n%s", body)
+	}
+	done := findStreamEvent(t, body, "response.function_call_arguments.done")
+	if done["name"] != "lookup" || done["arguments"] != `{"q":1}` {
+		t.Fatalf("done event name=%#v arguments=%#v", done["name"], done["arguments"])
+	}
+}
+
 func TestConvertStreamDoesNotEmitFragmentedToolName(t *testing.T) {
 	input := strings.Join([]string{
 		`data: {"id":"chatcmpl-tool","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"look"}}]},"finish_reason":null}]}`,

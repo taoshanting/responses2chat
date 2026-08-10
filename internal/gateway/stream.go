@@ -247,14 +247,14 @@ func (s *streamState) consume(chunk map[string]any) error {
 			if tool.callID == "" {
 				tool.callID = newID("call")
 			}
-			if rawName, exists := legacy["name"]; exists {
+			if rawName, exists := legacy["name"]; exists && rawName != nil {
 				name, ok := rawName.(string)
 				if !ok {
 					return errors.New("upstream function_call delta name must be a string")
 				}
 				tool.name += name
 			}
-			if rawArguments, exists := legacy["arguments"]; exists {
+			if rawArguments, exists := legacy["arguments"]; exists && rawArguments != nil {
 				arguments, ok := rawArguments.(string)
 				if !ok {
 					return errors.New("upstream function_call delta arguments must be a string")
@@ -278,29 +278,34 @@ func (s *streamState) consume(chunk map[string]any) error {
 			index := int(int64Number(call["index"]))
 			tool := s.ensureTool(index)
 			tool.modern = true
-			if rawID, exists := call["id"]; exists {
+			// Serializers without omitempty emit null or "" for id and the
+			// function fields on continuation chunks; treat those like absent
+			// fields instead of failing the stream.
+			if rawID, exists := call["id"]; exists && rawID != nil {
 				id, ok := rawID.(string)
-				if !ok || id == "" {
-					return errors.New("upstream tool call id must be a non-empty string")
+				if !ok {
+					return errors.New("upstream tool call id must be a string")
 				}
-				if tool.callID != "" && tool.callID != id {
-					return errors.New("upstream changed a tool call id mid-stream")
+				if id != "" {
+					if tool.callID != "" && tool.callID != id {
+						return errors.New("upstream changed a tool call id mid-stream")
+					}
+					tool.callID = id
 				}
-				tool.callID = id
 			}
 			rawFunction, hasFunction := call["function"]
 			function, functionOK := object(rawFunction)
 			if hasFunction && rawFunction != nil && !functionOK {
 				return errors.New("upstream tool call function delta must be an object")
 			}
-			if rawName, exists := function["name"]; exists {
+			if rawName, exists := function["name"]; exists && rawName != nil {
 				name, ok := rawName.(string)
 				if !ok {
 					return errors.New("upstream tool call name delta must be a string")
 				}
 				tool.name += name
 			}
-			if rawArguments, exists := function["arguments"]; exists {
+			if rawArguments, exists := function["arguments"]; exists && rawArguments != nil {
 				arguments, ok := rawArguments.(string)
 				if !ok {
 					return errors.New("upstream tool call arguments delta must be a string")
