@@ -582,6 +582,17 @@ func TestPSArrayPreservesWindowsArguments(t *testing.T) {
 	}
 }
 
+func TestWindowsPowerShellPathIsAbsolute(t *testing.T) {
+	t.Setenv("SystemRoot", `D:\CustomRoot`)
+	if got := windowsPowerShellPath(); got != `D:\CustomRoot\System32\WindowsPowerShell\v1.0\powershell.exe` {
+		t.Fatalf("windowsPowerShellPath = %q", got)
+	}
+	t.Setenv("SystemRoot", "")
+	if got := windowsPowerShellPath(); got != `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` {
+		t.Fatalf("fallback windowsPowerShellPath = %q", got)
+	}
+}
+
 func assertFileContent(t *testing.T, path, want string) {
 	t.Helper()
 	got, err := os.ReadFile(path)

@@ -1352,7 +1352,11 @@ func (u *Updater) applyUpdateWindows(newBinaryPath, tag string) error {
 		"  if (Test-Path $exe) { Move-Item -Force $exe $bak }",
 		"  Copy-Item -Force $new $exe",
 		"  Remove-Item -Force $new",
-		"  Start-Process -FilePath $exe -ArgumentList $argsList -WorkingDirectory $workDir",
+		"  if ($argsList.Count -gt 0) {",
+		"    Start-Process -FilePath $exe -ArgumentList $argsList -WorkingDirectory $workDir",
+		"  } else {",
+		"    Start-Process -FilePath $exe -WorkingDirectory $workDir",
+		"  }",
 		"} catch {",
 		"  if (Test-Path $bak) {",
 		"    if (Test-Path $exe) { Remove-Item -Force $exe }",
@@ -1391,8 +1395,9 @@ func (u *Updater) applyUpdateWindows(newBinaryPath, tag string) error {
 		}
 	}
 
-	proc, err := os.StartProcess("powershell.exe", []string{
-		"powershell.exe",
+	powershellPath := windowsPowerShellPath()
+	proc, err := os.StartProcess(powershellPath, []string{
+		powershellPath,
 		"-NoProfile",
 		"-ExecutionPolicy", "Bypass",
 		"-File", scriptPath,
@@ -1523,6 +1528,19 @@ func sanitizePathPart(value string) string {
 		return "update"
 	}
 	return b.String()
+}
+
+// windowsPowerShellPath returns the absolute path of the stock PowerShell
+// binary. os.StartProcess resolves relative names against the working
+// directory rather than PATH, so a bare "powershell.exe" only works when the
+// process happens to run from System32 and lets a writable working directory
+// shadow the real binary.
+func windowsPowerShellPath() string {
+	systemRoot := os.Getenv("SystemRoot")
+	if systemRoot == "" {
+		systemRoot = `C:\Windows`
+	}
+	return systemRoot + `\System32\WindowsPowerShell\v1.0\powershell.exe`
 }
 
 func psQuote(value string) string {
